@@ -1276,6 +1276,48 @@ class CameraManager(object):
             array = array[:, :, :3]
             array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+        elif self.sensors[self.index][0].startswith('sensor.camera.instance_segmentation'):
+            image.convert(self.sensors[self.index][1])
+            height = image.height
+            width = image.width
+            array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
+            array = np.reshape(array, (image.height, image.width, 4)).copy()
+            id_array = array.astype("uint16")
+            semantic_array = id_array[:, :, 2]
+            id_array = (array[:, :, 0] << 8) + array[:, :, 1]
+
+            objs = {}
+
+            desired_objs = [14,15,16]
+            for h in range(height):
+                for w in range(width):
+                    semantic_id = int(semantic_array[h][w])
+                    if semantic_id in desired_objs:
+                        track_id = id_array[h][w]
+                        if track_id not in objs:
+                            objs[track_id] = {"min_w": w, "max_w": w, "min_h": h, "max_h": h}
+                        if w < objs[track_id]["min_w"]:
+                            objs[track_id]["min_w"] = w
+                        elif w > objs[track_id]["max_w"]:
+                            objs[track_id]["max_w"] = w
+                        if h < objs[track_id]["min_h"]:
+                            objs[track_id]["min_h"] = h
+                        elif h > objs[track_id]["max_h"]:
+                            objs[track_id]["max_h"] = h
+            for track_id in objs:
+                bbox = objs[track_id]
+                y_min = bbox["min_h"]
+                y_max = bbox["max_h"]
+                x_min = bbox["min_w"]
+                x_max = bbox["max_w"]
+                cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
+                cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+                cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
+                cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+            array = array[:, :, :3]
+            array = array[:, :, ::-1]
+            
+            self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
         else:
             image.convert(self.sensors[self.index][1])
             height = image.height
