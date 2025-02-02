@@ -71,6 +71,7 @@ import re
 import os
 import weakref
 import time
+import cv2
 
 try:
     import pygame
@@ -300,7 +301,7 @@ class World(object):
         self.lane_invasion_sensor = LaneInvasionSensor(self.player, self.hud)
         self.gnss_sensor = GnssSensor(self.player)
         self.imu_sensor = IMUSensor(self.player)
-        self.camera_manager = CameraManager(self.player, self.hud, self._gamma)
+        self.camera_manager = CameraManager(self.world, self.player, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.set_sensor(cam_index, notify=False)
         actor_type = get_actor_display_name(self.player)
@@ -1095,12 +1096,13 @@ class RadarSensor(object):
 
 
 class CameraManager(object):
-    def __init__(self, parent_actor, hud, gamma_correction):
+    def __init__(self, world, parent_actor, hud, gamma_correction):
         self.sensor = None
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
         self.recording = False
+        self.world = world
         bound_x = 0.5 + self._parent.bounding_box.extent.x
         bound_y = 0.5 + self._parent.bounding_box.extent.y
         bound_z = 0.5 + self._parent.bounding_box.extent.z
@@ -1199,6 +1201,42 @@ class CameraManager(object):
             display.blit(self.surface, (0, 0))
 
     @staticmethod
+    def get_image_point(loc, K, w2c):
+        # Calculate 2D projection of 3D coordinate
+
+        # Format the input coordinate (loc is a carla.Position object)
+        point = np.array([loc.x, loc.y, loc.z, 1])
+        # transform to camera coordinates
+        point_camera = np.dot(w2c, point)
+
+        # New we must change from UE4's coordinate system to an "standard"
+        # (x, y ,z) -> (y, -z, x)
+        # and we remove the fourth componebonent also
+        point_camera = [point_camera[1], -point_camera[2], point_camera[0]]
+
+        # now project 3D->2D using the camera matrix
+        point_img = np.dot(K, point_camera)
+        # normalize
+        point_img[0] /= point_img[2]
+        point_img[1] /= point_img[2]
+
+        return point_img[0:2]
+
+    @staticmethod
+    def build_projection_matrix(w, h, fov, is_behind_camera=False):
+        focal = w / (2.0 * np.tan(fov * np.pi / 360.0))
+        K = np.identity(3)
+
+        if is_behind_camera:
+            K[0, 0] = K[1, 1] = -focal
+        else:
+            K[0, 0] = K[1, 1] = focal
+
+        K[0, 2] = w / 2.0
+        K[1, 2] = h / 2.0
+        return K
+
+    @staticmethod
     def _parse_image(weak_self, image):
         self = weak_self()
         if not self:
@@ -1240,8 +1278,61 @@ class CameraManager(object):
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
         else:
             image.convert(self.sensors[self.index][1])
+            height = image.height
+            width = image.width
+            fov = image.fov
+            K = CameraManager.build_projection_matrix(width, height, fov)
+
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4))
+            array = np.reshape(array, (image.height, image.width, 4)).copy()
+            world_2_camera = np.array(self.sensor.get_transform().get_inverse_matrix())
+
+            for npc in self.world.get_actors().filter('*vehicle*'):
+
+                vehicle = self._parent
+                # Filter out the ego vehicle
+                if npc.id != vehicle.id:
+
+                    bb = npc.bounding_box
+                    dist = npc.get_transform().location.distance(vehicle.get_transform().location)
+
+                    # Filter for the vehicles within 50m
+                    if dist < 500:
+
+                    # Calculate the dot product between the forward vector
+                    # of the vehicle and the vector between the vehicle
+                    # and the other vehicle. We threshold this dot product
+                    # to limit to drawing bounding boxes IN FRONT OF THE CAMERA
+                        forward_vec = vehicle.get_transform().get_forward_vector()
+                        ray = npc.get_transform().location - vehicle.get_transform().location
+
+                        if forward_vec.dot(ray) > 0:
+                            p1 = CameraManager.get_image_point(bb.location, K, world_2_camera)
+                            verts = [v for v in bb.get_world_vertices(npc.get_transform())]
+                            x_max = -10000
+                            x_min = 10000
+                            y_max = -10000
+                            y_min = 10000
+
+                            for vert in verts:
+                                p = CameraManager.get_image_point(vert, K, world_2_camera)
+                                # Find the rightmost vertex
+                                if p[0] > x_max:
+                                    x_max = p[0]
+                                # Find the leftmost vertex
+                                if p[0] < x_min:
+                                    x_min = p[0]
+                                # Find the highest vertex
+                                if p[1] > y_max:
+                                    y_max = p[1]
+                                # Find the lowest  vertex
+                                if p[1] < y_min:
+                                    y_min = p[1]
+
+                            cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
+                            cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+                            cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
+                            cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
             array = array[:, :, :3]
             array = array[:, :, ::-1]
             self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
