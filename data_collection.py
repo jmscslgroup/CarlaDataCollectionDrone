@@ -383,7 +383,6 @@ class World(object):
 # -- HUD -----------------------------------------------------------------------
 # ==============================================================================
 
-
 class HUD(object):
     def __init__(self, width, height):
         self.dim = (width, height)
@@ -394,8 +393,6 @@ class HUD(object):
         mono = default_font if default_font in fonts else fonts[0]
         mono = pygame.font.match_font(mono)
         self._font_mono = pygame.font.Font(mono, 12 if os.name == 'nt' else 14)
-        self._notifications = FadingText(font, (width, 40), (0, height - 40))
-        self.help = HelpText(pygame.font.Font(mono, 16), width, height)
         self.server_fps = 0
         self.frame = 0
         self.simulation_time = 0
@@ -413,7 +410,6 @@ class HUD(object):
         self.simulation_time = timestamp.elapsed_seconds
 
     def tick(self, world, clock):
-        self._notifications.tick(world, clock)
         if not self._show_info:
             return
         t = world.player.get_transform()
@@ -490,10 +486,9 @@ class HUD(object):
         self._show_info = not self._show_info
 
     def notification(self, text, seconds=2.0):
-        self._notifications.set_text(text, seconds=seconds)
-
+        pass
     def error(self, text):
-        self._notifications.set_text('Error: %s' % text, (255, 0, 0))
+        pass
 
     def render(self, display):
         if self._show_info:
@@ -530,68 +525,6 @@ class HUD(object):
                     surface = self._font_mono.render(item, True, (255, 255, 255))
                     display.blit(surface, (8, v_offset))
                 v_offset += 18
-        self._notifications.render(display)
-        self.help.render(display)
-
-
-# ==============================================================================
-# -- FadingText ----------------------------------------------------------------
-# ==============================================================================
-
-
-class FadingText(object):
-    def __init__(self, font, dim, pos):
-        self.font = font
-        self.dim = dim
-        self.pos = pos
-        self.seconds_left = 0
-        self.surface = pygame.Surface(self.dim)
-
-    def set_text(self, text, color=(255, 255, 255), seconds=2.0):
-        text_texture = self.font.render(text, True, color)
-        self.surface = pygame.Surface(self.dim)
-        self.seconds_left = seconds
-        self.surface.fill((0, 0, 0, 0))
-        self.surface.blit(text_texture, (10, 11))
-
-    def tick(self, _, clock):
-        delta_seconds = 1e-3 * clock.get_time()
-        self.seconds_left = max(0.0, self.seconds_left - delta_seconds)
-        self.surface.set_alpha(500.0 * self.seconds_left)
-
-    def render(self, display):
-        display.blit(self.surface, self.pos)
-
-
-# ==============================================================================
-# -- HelpText ------------------------------------------------------------------
-# ==============================================================================
-
-
-class HelpText(object):
-    """Helper class to handle text output using pygame"""
-    def __init__(self, font, width, height):
-        lines = __doc__.split('\n')
-        self.font = font
-        self.line_space = 18
-        self.dim = (780, len(lines) * self.line_space + 12)
-        self.pos = (0.5 * width - 0.5 * self.dim[0], 0.5 * height - 0.5 * self.dim[1])
-        self.seconds_left = 0
-        self.surface = pygame.Surface(self.dim)
-        self.surface.fill((0, 0, 0, 0))
-        for n, line in enumerate(lines):
-            text_texture = self.font.render(line, True, (255, 255, 255))
-            self.surface.blit(text_texture, (22, n * self.line_space))
-            self._render = False
-        self.surface.set_alpha(220)
-
-    def toggle(self):
-        self._render = not self._render
-
-    def render(self, display):
-        if self._render:
-            display.blit(self.surface, self.pos)
-
 
 # ==============================================================================
 # -- CollisionSensor -----------------------------------------------------------
