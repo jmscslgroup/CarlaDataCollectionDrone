@@ -194,7 +194,7 @@ class World(object):
         # Set up the sensors.
         self.camera_manager = CameraManager(self.world, self.player, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
-        self.camera_manager.set_sensor(cam_index, notify=False)
+        self.camera_manager.create_sensors()
         actor_type = get_actor_display_name(self.player)
         self.traffic_manager.update_vehicle_lights(self.player, True)
 
@@ -294,32 +294,21 @@ class CameraManager(object):
         self.surface = None
         self._parent = parent_actor
         self.hud = hud
-        self.recording = False
+        self.bboxes = []
+        self.image = []
+        self.bboxes_index = 0
+        self.image_index = 0
         self.world = world
         bound_x = 0.5 + self._parent.bounding_box.extent.x
         bound_y = 0.5 + self._parent.bounding_box.extent.y
         bound_z = 0.5 + self._parent.bounding_box.extent.z
         Attachment = carla.AttachmentType
 
-        if not self._parent.type_id.startswith("walker.pedestrian"):
-            self._camera_transforms = [
-                (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=+0.8*bound_x, y=+0.0*bound_y, z=1.3*bound_z)), Attachment.Rigid),
-                (carla.Transform(carla.Location(x=+1.9*bound_x, y=+1.0*bound_y, z=1.2*bound_z)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-2.8*bound_x, y=+0.0*bound_y, z=4.6*bound_z), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-1.0, y=-1.0*bound_y, z=0.4*bound_z)), Attachment.Rigid)]
-        else:
-            self._camera_transforms = [
-                (carla.Transform(carla.Location(x=-2.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=1.6, z=1.7)), Attachment.Rigid),
-                (carla.Transform(carla.Location(x=2.5, y=0.5, z=0.0), carla.Rotation(pitch=-8.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=-4.0, z=2.0), carla.Rotation(pitch=6.0)), Attachment.SpringArmGhost),
-                (carla.Transform(carla.Location(x=0, y=-2.5, z=-0.0), carla.Rotation(yaw=90.0)), Attachment.Rigid)]
+        self._camera_transforms = (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost)
 
-        self.transform_index = 1
         self.sensors = [
-            ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}],
-            ['sensor.camera.instance_segmentation', cc.Raw, 'Camera Instance Segmentation (Raw)', {}],
+            ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}, None],
+            ['sensor.camera.instance_segmentation', cc.Raw, 'Camera Instance Segmentation (Raw)', {}, None],
         ]
         world = self._parent.get_world()
         bp_library = world.get_blueprint_library()
@@ -332,93 +321,33 @@ class CameraManager(object):
                     bp.set_attribute('gamma', str(gamma_correction))
                 for attr_name, attr_value in item[3].items():
                     bp.set_attribute(attr_name, attr_value)
-            elif item[0].startswith('sensor.lidar'):
-                self.lidar_range = 50
-
-                for attr_name, attr_value in item[3].items():
-                    bp.set_attribute(attr_name, attr_value)
-                    if attr_name == 'range':
-                        self.lidar_range = float(attr_value)
-
             item.append(bp)
         self.index = None
 
-    def toggle_camera(self):
-        self.transform_index = (self.transform_index + 1) % len(self._camera_transforms)
-        self.set_sensor(self.index, notify=False, force_respawn=True)
-
-    def set_sensor(self, index, notify=True, force_respawn=False):
-        index = index % len(self.sensors)
-        needs_respawn = True if self.index is None else \
-            (force_respawn or (self.sensors[index][2] != self.sensors[self.index][2]))
-        if needs_respawn:
-            if self.sensor is not None:
-                self.sensor.destroy()
-                self.surface = None
-            self.sensor = self._parent.get_world().spawn_actor(
-                self.sensors[index][-1],
-                self._camera_transforms[self.transform_index][0],
+    def create_sensors(self):
+        for index in range(len(self.sensors)):
+            self.sensors[index][3] = self._parent.get_world().spawn_actor(
+                self.sensors[index][-2],
+                self._camera_transforms[0],
                 attach_to=self._parent,
-                attachment_type=self._camera_transforms[self.transform_index][1])
+                attachment_type=self._camera_transforms[1])
             # We need to pass the lambda a weak reference to self to avoid
             # circular reference.
             weak_self = weakref.ref(self)
-            self.sensor.listen(lambda image: CameraManager._parse_image(weak_self, image))
+            self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, index))
         self.index = index
-
-    def next_sensor(self):
-        self.set_sensor(self.index + 1)
-
-    def toggle_recording(self):
-        self.recording = not self.recording
 
     def render(self, display):
         if self.surface is not None:
             display.blit(self.surface, (0, 0))
 
     @staticmethod
-    def get_image_point(loc, K, w2c):
-        # Calculate 2D projection of 3D coordinate
-
-        # Format the input coordinate (loc is a carla.Position object)
-        point = np.array([loc.x, loc.y, loc.z, 1])
-        # transform to camera coordinates
-        point_camera = np.dot(w2c, point)
-
-        # New we must change from UE4's coordinate system to an "standard"
-        # (x, y ,z) -> (y, -z, x)
-        # and we remove the fourth componebonent also
-        point_camera = [point_camera[1], -point_camera[2], point_camera[0]]
-
-        # now project 3D->2D using the camera matrix
-        point_img = np.dot(K, point_camera)
-        # normalize
-        point_img[0] /= point_img[2]
-        point_img[1] /= point_img[2]
-
-        return point_img[0:2]
-
-    @staticmethod
-    def build_projection_matrix(w, h, fov, is_behind_camera=False):
-        focal = w / (2.0 * np.tan(fov * np.pi / 360.0))
-        K = np.identity(3)
-
-        if is_behind_camera:
-            K[0, 0] = K[1, 1] = -focal
-        else:
-            K[0, 0] = K[1, 1] = focal
-
-        K[0, 2] = w / 2.0
-        K[1, 2] = h / 2.0
-        return K
-
-    @staticmethod
-    def _parse_image(weak_self, image):
+    def _parse_image(weak_self, image, index):
         self = weak_self()
         if not self:
             return
-        if self.sensors[self.index][0].startswith('sensor.camera.instance_segmentation'):
-            image.convert(self.sensors[self.index][1])
+        if self.sensors[index][0].startswith('sensor.camera.instance_segmentation'):
+            image.convert(self.sensors[index][1])
             height = image.height
             width = image.width
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
@@ -445,82 +374,41 @@ class CameraManager(object):
                             objs[track_id]["min_h"] = h
                         elif h > objs[track_id]["max_h"]:
                             objs[track_id]["max_h"] = h
-            for track_id in objs:
-                bbox = objs[track_id]
-                y_min = bbox["min_h"]
-                y_max = bbox["max_h"]
-                x_min = bbox["min_w"]
-                x_max = bbox["max_w"]
-                cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
-                cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-                cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
-                cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-            array = array[:, :, :3]
-            array = array[:, :, ::-1]
-            
-            self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+            self.bboxes.append(objs)
+            if (len(self.bboxes) > 0) and (len(self.image) > 0):
+                self.save_data()
         else:
-            image.convert(self.sensors[self.index][1])
+            image.convert(self.sensors[index][1])
             height = image.height
             width = image.width
             fov = image.fov
-            K = CameraManager.build_projection_matrix(width, height, fov)
 
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
-            array = np.reshape(array, (image.height, image.width, 4)).copy()
-            world_2_camera = np.array(self.sensor.get_transform().get_inverse_matrix())
+            array = np.reshape(array, (height, width, 4)).copy()
+            self.image.append(array)
+            if (len(self.bboxes) > 0) and (len(self.image) > 0):
+                self.save_data()
 
-            for npc in self.world.get_actors().filter('*vehicle*'):
+    def save_data():
+        objs = self.bboxes.pop(0)
+        array = self.image.pop(0)
+        for track_id in objs:
+            bbox = objs[track_id]
+            y_min = bbox["min_h"]
+            y_max = bbox["max_h"]
+            x_min = bbox["min_w"]
+            x_max = bbox["max_w"]
+            cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
+            cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+            cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
+            cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+        array = array[:, :, :3]
+        array = array[:, :, ::-1]
+        self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
+        image.save_to_disk('_out/%08d' % image.frame)
+        self.image_index += 1
+        self.bboxes_index += 1
 
-                vehicle = self._parent
-                # Filter out the ego vehicle
-                if npc.id != vehicle.id:
-
-                    bb = npc.bounding_box
-                    dist = npc.get_transform().location.distance(vehicle.get_transform().location)
-
-                    # Filter for the vehicles within 50m
-                    if dist < 500:
-
-                    # Calculate the dot product between the forward vector
-                    # of the vehicle and the vector between the vehicle
-                    # and the other vehicle. We threshold this dot product
-                    # to limit to drawing bounding boxes IN FRONT OF THE CAMERA
-                        forward_vec = vehicle.get_transform().get_forward_vector()
-                        ray = npc.get_transform().location - vehicle.get_transform().location
-
-                        if forward_vec.dot(ray) > 0:
-                            p1 = CameraManager.get_image_point(bb.location, K, world_2_camera)
-                            verts = [v for v in bb.get_world_vertices(npc.get_transform())]
-                            x_max = -10000
-                            x_min = 10000
-                            y_max = -10000
-                            y_min = 10000
-
-                            for vert in verts:
-                                p = CameraManager.get_image_point(vert, K, world_2_camera)
-                                # Find the rightmost vertex
-                                if p[0] > x_max:
-                                    x_max = p[0]
-                                # Find the leftmost vertex
-                                if p[0] < x_min:
-                                    x_min = p[0]
-                                # Find the highest vertex
-                                if p[1] > y_max:
-                                    y_max = p[1]
-                                # Find the lowest  vertex
-                                if p[1] < y_min:
-                                    y_min = p[1]
-
-                            cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
-                            cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-                            cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
-                            cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-            array = array[:, :, :3]
-            array = array[:, :, ::-1]
-            self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
-        if self.recording:
-            image.save_to_disk('_out/%08d' % image.frame)
 
 class Traffic(object):
     def __init__(self, client, traffic_manager, args):
@@ -867,7 +755,6 @@ def main():
 
     except KeyboardInterrupt:
         print('\nCancelled by user. Bye!')
-
 
 if __name__ == '__main__':
 
