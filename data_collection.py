@@ -233,10 +233,6 @@ class World(object):
     def tick(self, clock):
         self.hud.tick(self, clock)
 
-    def render(self, display):
-        self.camera_manager.render(display)
-        self.hud.render(display)
-
     def destroy_sensors(self):
         self.camera_manager.sensor.destroy()
         self.camera_manager.sensor = None
@@ -259,13 +255,6 @@ class World(object):
 class HUD(object):
     def __init__(self, width, height):
         self.dim = (width, height)
-        font = pygame.font.Font(pygame.font.get_default_font(), 20)
-        font_name = 'courier' if os.name == 'nt' else 'mono'
-        fonts = [x for x in pygame.font.get_fonts() if font_name in x]
-        default_font = 'ubuntumono'
-        mono = default_font if default_font in fonts else fonts[0]
-        mono = pygame.font.match_font(mono)
-        self._font_mono = pygame.font.Font(mono, 12 if os.name == 'nt' else 14)
         self.server_fps = 0
         self.frame = 0
         self.simulation_time = 0
@@ -280,9 +269,6 @@ class HUD(object):
     def tick(self, world, clock):
         pass
 
-    def render(self, display):
-        pass
-
 # ==============================================================================
 # -- CameraManager -------------------------------------------------------------
 # ==============================================================================
@@ -291,7 +277,6 @@ class HUD(object):
 class CameraManager(object):
     def __init__(self, world, parent_actor, hud, gamma_correction):
         self.sensor = None
-        self.surface = None
         self._parent = parent_actor
         self.hud = hud
         self.bboxes = []
@@ -336,10 +321,6 @@ class CameraManager(object):
             weak_self = weakref.ref(self)
             self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, index))
         self.index = index
-
-    def render(self, display):
-        if self.surface is not None:
-            display.blit(self.surface, (0, 0))
 
     @staticmethod
     def _parse_image(weak_self, image, index):
@@ -404,7 +385,6 @@ class CameraManager(object):
             cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
         array = array[:, :, :3]
         array = array[:, :, ::-1]
-        self.surface = pygame.surfarray.make_surface(array.swapaxes(0, 1))
         image.save_to_disk('_out/%08d' % image.frame)
         self.image_index += 1
         self.bboxes_index += 1
@@ -629,7 +609,6 @@ class Traffic(object):
 
 def game_loop(args):
     pygame.init()
-    pygame.font.init()
     world = None
     original_settings = None
 
@@ -656,12 +635,6 @@ def game_loop(args):
             print("WARNING: You are currently in asynchronous mode and could "
                   "experience some issues with the traffic simulation")
 
-        display = pygame.display.set_mode(
-            (args.width, args.height),
-            pygame.HWSURFACE | pygame.DOUBLEBUF)
-        display.fill((0,0,0))
-        pygame.display.flip()
-
         hud = HUD(args.width, args.height)
         world = World(sim_world, hud, traffic_manager, args)
 
@@ -676,8 +649,6 @@ def game_loop(args):
                 sim_world.tick()
             clock.tick_busy_loop(60)
             world.tick(clock)
-            world.render(display)
-            pygame.display.flip()
 
     finally:
     
