@@ -15,6 +15,10 @@ import os
 import weakref
 import time
 import cv2
+import copy
+import shutil
+import json
+from multiprocessing import Queue, Process, Value, Lock
 
 try:
     import pygame
@@ -102,7 +106,8 @@ def get_actor_blueprints(world, filter, generation):
 # ==============================================================================
 
 class World(object):
-    def __init__(self, carla_world, hud, traffic_manager, args):
+    def __init__(self, client, carla_world, hud, traffic_manager, args):
+        self.client = client
         self.world = carla_world
         self.sync = args.sync
         self.traffic_manager = traffic_manager
@@ -117,6 +122,7 @@ class World(object):
         self.hud = hud
         self.player = None
         self.camera_manager = None
+        self.recorder = None
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
         self._actor_filter = args.filter
@@ -192,7 +198,8 @@ class World(object):
             self.show_vehicle_telemetry = False
             self.modify_vehicle_physics(self.player)
         # Set up the sensors.
-        self.camera_manager = CameraManager(self.world, self.player, self.hud, self._gamma)
+        self.recorder = Recorder()
+        self.camera_manager = CameraManager(self.client, self.world, self.player, self.recorder, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.create_sensors()
         actor_type = get_actor_display_name(self.player)
@@ -232,6 +239,7 @@ class World(object):
 
     def tick(self, clock):
         self.hud.tick(self, clock)
+        self.camera_manager.tick()
 
     def destroy_sensors(self):
         self.camera_manager.sensor.destroy()
@@ -247,6 +255,7 @@ class World(object):
                 sensor.destroy()
         if self.player is not None:
             self.player.destroy()
+        self.recorder.destroy()
 
 # ==============================================================================
 # -- HUD -----------------------------------------------------------------------
@@ -275,14 +284,15 @@ class HUD(object):
 
 
 class CameraManager(object):
-    def __init__(self, world, parent_actor, hud, gamma_correction):
+    def __init__(self, client, world, parent_actor, recorder, hud, gamma_correction):
         self.sensor = None
         self._parent = parent_actor
         self.hud = hud
         self.bboxes = []
         self.image = []
-        self.bboxes_index = 0
-        self.image_index = 0
+        self.recorder = recorder
+ 
+        self.client = client
         self.world = world
         bound_x = 0.5 + self._parent.bounding_box.extent.x
         bound_y = 0.5 + self._parent.bounding_box.extent.y
@@ -306,28 +316,45 @@ class CameraManager(object):
                     bp.set_attribute('gamma', str(gamma_correction))
                 for attr_name, attr_value in item[3].items():
                     bp.set_attribute(attr_name, attr_value)
-            item.append(bp)
-        self.index = None
+            item[-1] = bp
 
     def create_sensors(self):
+        batch = []
+        SpawnActor = carla.command.SpawnActor
         for index in range(len(self.sensors)):
-            self.sensors[index][3] = self._parent.get_world().spawn_actor(
-                self.sensors[index][-2],
+            batch.append(SpawnActor(self.sensors[index][-1],
                 self._camera_transforms[0],
-                attach_to=self._parent,
-                attachment_type=self._camera_transforms[1])
-            # We need to pass the lambda a weak reference to self to avoid
-            # circular reference.
-            weak_self = weakref.ref(self)
-            self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, index))
-        self.index = index
+                self._parent))
+
+        responses = self.client.apply_batch_sync(batch, False)
+        for index in range(len(responses)):
+            response = responses[index]
+            if response.error:
+                logging.error(response.error)
+            else:
+                self.sensors[index][3] = self.world.get_actor(response.actor_id)
+                # We need to pass the lambda a weak reference to self to avoid
+                # circular reference.
+                weak_self = weakref.ref(self)
+                
+                if (index == 0):
+                    self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 0))
+                else:
+                    self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 1))
+                
 
     @staticmethod
     def _parse_image(weak_self, image, index):
         self = weak_self()
         if not self:
             return
+        #print(self.world.get_actor(self.sensors[0][-2].id), self.sensors[0][-2].is_listening())
+        #print(self.world.get_actor(self.sensors[1][-2].id), self.sensors[1][-2].is_listening())
+        #print("Parsing {}!".format(index), len(self.bboxes), len(self.image))
         if self.sensors[index][0].startswith('sensor.camera.instance_segmentation'):
+            if ((image.frame_number % 20) != 0):
+                return
+            
             image.convert(self.sensors[index][1])
             height = image.height
             width = image.width
@@ -338,27 +365,15 @@ class CameraManager(object):
             id_array = (array[:, :, 0] << 8) + array[:, :, 1]
 
             objs = {}
-
-            desired_objs = [14,15,16]
-            for h in range(height):
-                for w in range(width):
-                    semantic_id = int(semantic_array[h][w])
-                    if semantic_id in desired_objs:
-                        track_id = id_array[h][w]
-                        if track_id not in objs:
-                            objs[track_id] = {"min_w": w, "max_w": w, "min_h": h, "max_h": h}
-                        if w < objs[track_id]["min_w"]:
-                            objs[track_id]["min_w"] = w
-                        elif w > objs[track_id]["max_w"]:
-                            objs[track_id]["max_w"] = w
-                        if h < objs[track_id]["min_h"]:
-                            objs[track_id]["min_h"] = h
-                        elif h > objs[track_id]["max_h"]:
-                            objs[track_id]["max_h"] = h
-            self.bboxes.append(objs)
-            if (len(self.bboxes) > 0) and (len(self.image) > 0):
-                self.save_data()
+            objs["base_image"] = np.reshape(array, (image.height, image.width, 4)).copy()
+            objs["id_array"] = id_array
+            objs["semantic_array"] = semantic_array
+            objs["height"] = image.height
+            objs["width"] = image.width
+            self.bboxes.append((objs, image.frame_number))
         else:
+            if ((image.frame_number % 20) != 0):
+                return
             image.convert(self.sensors[index][1])
             height = image.height
             width = image.width
@@ -366,29 +381,28 @@ class CameraManager(object):
 
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
             array = np.reshape(array, (height, width, 4)).copy()
-            self.image.append(array)
-            if (len(self.bboxes) > 0) and (len(self.image) > 0):
-                self.save_data()
+            self.image.append((array, image.frame_number))
+            
+    def save_data(self):
+        bboxes_indices = [self.bboxes[i][1] for i in range(len(self.bboxes))]
+        image_indices = [self.image[i][1] for i in range(len(self.image))]
+        print(bboxes_indices, image_indices)
+        while (self.bboxes[0][1] < self.image[0][1]):
+            self.bboxes.pop(0)
+        if (len(self.bboxes) == 0):
+            return
+        while (self.image[0][1] < self.bboxes[0][1]):
+            self.image.pop(0)
+        if (len(self.image) == 0):
+            return
+        objs = self.bboxes.pop(0)[0]
+        array = self.image.pop(0)[0]
 
-    def save_data():
-        objs = self.bboxes.pop(0)
-        array = self.image.pop(0)
-        for track_id in objs:
-            bbox = objs[track_id]
-            y_min = bbox["min_h"]
-            y_max = bbox["max_h"]
-            x_min = bbox["min_w"]
-            x_max = bbox["max_w"]
-            cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
-            cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-            cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
-            cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-        array = array[:, :, :3]
-        array = array[:, :, ::-1]
-        image.save_to_disk('_out/%08d' % image.frame)
-        self.image_index += 1
-        self.bboxes_index += 1
+        self.recorder.record_entry(array, objs)
 
+    def tick(self):
+        if (len(self.bboxes) > 0) and (len(self.image) > 0):
+            self.save_data()
 
 class Traffic(object):
     def __init__(self, client, traffic_manager, args):
@@ -602,6 +616,107 @@ class Traffic(object):
         self.client.apply_batch([carla.command.DestroyActor(x) for x in self.all_id])
 
         time.sleep(0.5)
+
+    def destroy(self):
+        self.destroy_traffic()
+
+class Recorder(object):
+    def __init__(self):
+        self.coco_lock = Lock()
+        self.coco_image_index = 0
+        self.image_index = Value('i', 0)
+        self.video_index = Value('i', 0)
+        self.input_queue = Queue()
+        self.record_process = Process(target=Recorder.record_thread, args=(self.input_queue, self.image_index, self.video_index))
+        self.initialize_coco()
+        shutil.rmtree("output/", ignore_errors=True)
+        os.makedirs("output/", exist_ok=False)
+        self.record_process.start()
+        print("Started recorder")
+
+    @staticmethod
+    def record_thread(input_queue, image_index, video_index):
+        while True:
+            array, objs = input_queue.get(block=True)
+            
+            for track_id in objs:
+                bbox = objs[track_id]
+                y_min = bbox["min_h"]
+                y_max = bbox["max_h"]
+                x_min = bbox["min_w"]
+                x_max = bbox["max_w"]
+                cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
+                cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+                cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
+                cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+            #array = array[:, :, :3]
+            #array = array[:, :, ::-1]
+            os.makedirs("output/%08d" % video_index.value, exist_ok=True)
+            cv2.imwrite("output/%08d/%08d.png" % (video_index.value, image_index.value), array)
+            #cv2.imwrite("output/%08d/%08d_debug.png" % (video_index.value, image_index.value), segmentation["base_image"])
+            #image.save_to_disk('_out/%08d' % image.frame)
+            image_index.value += 1
+
+    def record_entry(self, array, segmentation):
+        semantic_array = segmentation["semantic_array"]
+        id_array = segmentation["id_array"]
+        objs = {}
+
+        desired_objs = [14,15,16]
+        for h in range(segmentation["height"]):
+            for w in range(segmentation["width"]):
+                semantic_id = int(semantic_array[h][w])
+                if semantic_id in desired_objs:
+                    track_id = id_array[h][w]
+                    if track_id not in objs:
+                        objs[track_id] = {"min_w": w, "max_w": w, "min_h": h, "max_h": h}
+                    if w < objs[track_id]["min_w"]:
+                        objs[track_id]["min_w"] = w
+                    elif w > objs[track_id]["max_w"]:
+                        objs[track_id]["max_w"] = w
+                    if h < objs[track_id]["min_h"]:
+                        objs[track_id]["min_h"] = h
+                    elif h > objs[track_id]["max_h"]:
+                        objs[track_id]["max_h"] = h
+        self.input_queue.put((array, objs))
+        self.add_coco_entry(objs, segmentation["width"], segmentation["height"])
+
+    def initialize_coco(self):
+        self.coco_data = {}
+        self.coco_data["info"] = {}
+        self.coco_data["licenses"] = []
+        self.coco_data["images"] = []
+        self.coco_data["annotations"] = []
+        self.coco_data["categories"] = [
+            {"supercategory": "vehicle","id": 0,"name": "vehicle"}
+        ]
+
+
+    def add_coco_entry(self, objs, width, height):
+        self.coco_lock.acquire()
+        image_entry = {"id": int(self.coco_image_index), "width": float(width), "height": float(height), "file_name": "%08d/%08d.png" % (self.video_index.value, self.coco_image_index)}
+        self.coco_data["images"].append(image_entry)
+        for track_id in objs:
+            bbox = objs[track_id]
+            x = float(objs[track_id]["min_w"])
+            y = float(objs[track_id]["min_h"])
+            w = float(objs[track_id]["max_w"]) - x
+            h = float(objs[track_id]["max_h"]) - y
+            annotation_entry = {"id": int(track_id), "category_id": 0, "iscrowd": 0, "image_id": int(self.coco_image_index), "area": w*h, "bbox": [x, y, w, h]}
+            self.coco_data["annotations"].append(annotation_entry)
+        self.coco_image_index += 1
+        self.coco_lock.release()
+
+    def save_coco(self):
+        with open("output/coco.json", "w+") as f:
+            json.dump(self.coco_data, f, indent=4)
+
+    def destroy(self):
+        self.record_process.terminate()
+        self.record_process.join()
+        self.save_coco()
+        print("Recorder stopped!")
+
 # ==============================================================================
 # -- game_loop() ---------------------------------------------------------------
 # ==============================================================================
@@ -627,6 +742,8 @@ def game_loop(args):
             if not settings.synchronous_mode:
                 settings.synchronous_mode = True
                 settings.fixed_delta_seconds = 0.05
+            else:
+                settings.fixed_delta_seconds = 0.05
             sim_world.apply_settings(settings)
 
             traffic_manager.set_synchronous_mode(True)
@@ -636,7 +753,7 @@ def game_loop(args):
                   "experience some issues with the traffic simulation")
 
         hud = HUD(args.width, args.height)
-        world = World(sim_world, hud, traffic_manager, args)
+        world = World(client, sim_world, hud, traffic_manager, args)
 
         if args.sync:
             sim_world.tick()
@@ -652,7 +769,7 @@ def game_loop(args):
 
     finally:
     
-        traffic.destroy_traffic()
+        traffic.destroy()
 
         if original_settings:
             sim_world.apply_settings(original_settings)
@@ -728,5 +845,4 @@ def main():
         print('\nCancelled by user. Bye!')
 
 if __name__ == '__main__':
-
     main()
