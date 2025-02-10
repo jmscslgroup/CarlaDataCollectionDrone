@@ -273,6 +273,8 @@ class CameraManager(object):
             item[-1] = bp
 
     def create_sensors(self):
+        pass
+        """
         batch = []
         SpawnActor = carla.command.SpawnActor
         for index in range(len(self.sensors)):
@@ -294,6 +296,7 @@ class CameraManager(object):
                     self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 0))
                 else:
                     self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 1))
+        """
                 
 
     @staticmethod
@@ -723,10 +726,11 @@ def game_loop(args):
             world.tick(clock)
 
     except Exception as e:
-        print(e.message)
+        print("EXCEPTION: ", e.message)
     finally:
     
         traffic.destroy()
+        traffic_manager.shutdown()
 
         if original_settings:
             sim_world.apply_settings(original_settings)
