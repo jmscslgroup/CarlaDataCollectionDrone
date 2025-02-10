@@ -252,6 +252,7 @@ class CameraManager(object):
  
         self.client = client
         self.world = world
+        #self.waypoints = world.generate_waypoints(0.1)
 
         print("Goodies loaded up!")
 
@@ -355,9 +356,26 @@ class CameraManager(object):
 
         self.recorder.record_entry(array, objs)
 
+    def switch_waypoints():
+        pass
+        """
+        selected_waypoint = self.waypoints[0]
+        self.waypoints = selected_waypoint.next(0.1)
+        ApplyTransform = carla.command.ApplyTransform
+
+        batch = []
+        for index in range(len(self.sensors)):
+            actor_id = self.sensors[index][3].id
+            batch.append(ApplyTransform(actor_id, selected_waypoint.transform))
+        
+        self.client.apply_batch_sync(batch, False)
+        """
+
     def tick(self):
+        self.switch_waypoints()
         if (len(self.bboxes) > 0) and (len(self.image) > 0):
             self.save_data()
+        
 
 class Traffic(object):
     def __init__(self, client, traffic_manager, args):
@@ -723,11 +741,12 @@ def game_loop(args):
                 sim_world.tick()
             clock.tick_busy_loop(60)
             world.tick(clock)
+            print("ticking")
 
     except Exception as e:
         print("EXCEPTION: ", e.message)
     finally:
-    
+        print("doing shut down!")
         traffic.destroy()
         traffic_manager.shut_down()
 
