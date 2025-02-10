@@ -157,9 +157,11 @@ class World(object):
 
         # Set up the sensors.
         self.recorder = Recorder()
+        print("Starting camera manager!")
         self.camera_manager = CameraManager(self.client, self.world, self.recorder, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.create_sensors()
+        print("Camera Manager finished!")
 
         if self.sync:
             self.world.tick()
@@ -170,7 +172,7 @@ class World(object):
         self._weather_index += -1 if reverse else 1
         self._weather_index %= len(self._weather_presets)
         preset = self._weather_presets[self._weather_index]
-        self.player.get_world().set_weather(preset[0])
+        self.world.set_weather(preset[0])
 
     def next_map_layer(self, reverse=False):
         self.current_map_layer += -1 if reverse else 1
@@ -212,8 +214,6 @@ class World(object):
             if sensor is not None:
                 sensor.stop()
                 sensor.destroy()
-        if self.player is not None:
-            self.player.destroy()
         self.recorder.destroy()
 
 # ==============================================================================
@@ -253,13 +253,15 @@ class CameraManager(object):
         self.client = client
         self.world = world
 
+        print("Goodies loaded up!")
+
         self._camera_transforms = carla.Transform(carla.Location(x=-2.0, y=+0.0, z=20.0), carla.Rotation(pitch=8.0))
 
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}, None],
             ['sensor.camera.instance_segmentation', cc.Raw, 'Camera Instance Segmentation (Raw)', {}, None],
         ]
-        world = self._parent.get_world()
+        
         bp_library = world.get_blueprint_library()
         for item in self.sensors:
             bp = bp_library.find(item[0])
@@ -273,8 +275,6 @@ class CameraManager(object):
             item[-1] = bp
 
     def create_sensors(self):
-        pass
-        """
         batch = []
         SpawnActor = carla.command.SpawnActor
         for index in range(len(self.sensors)):
@@ -296,7 +296,6 @@ class CameraManager(object):
                     self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 0))
                 else:
                     self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 1))
-        """
                 
 
     @staticmethod
@@ -730,7 +729,7 @@ def game_loop(args):
     finally:
     
         traffic.destroy()
-        traffic_manager.shutdown()
+        traffic_manager.shut_down()
 
         if original_settings:
             sim_world.apply_settings(original_settings)
