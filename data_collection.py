@@ -126,40 +126,15 @@ class World(object):
         self.recorder = None
         self._weather_presets = find_weather_presets()
         self._weather_index = 0
-        self._actor_filter = args.filter
-        self._actor_generation = args.generation
         self._gamma = args.gamma
         self.restart()
         self.world.on_tick(hud.on_world_tick)
-        self.recording_start = 0
-        self.constant_velocity_enabled = False
-        self.show_vehicle_telemetry = False
-        self.doors_are_open = False
-        self.current_map_layer = 0
-        self.map_layer_names = [
-            carla.MapLayer.NONE,
-            carla.MapLayer.Buildings,
-            carla.MapLayer.Decals,
-            carla.MapLayer.Foliage,
-            carla.MapLayer.Ground,
-            carla.MapLayer.ParkedVehicles,
-            carla.MapLayer.Particles,
-            carla.MapLayer.Props,
-            carla.MapLayer.StreetLights,
-            carla.MapLayer.Walls,
-            carla.MapLayer.All
-        ]
 
     def restart(self):
-        # Keep same camera config if the camera manager exists.
-        cam_index = self.camera_manager.index if self.camera_manager is not None else 0
-        cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
-
         # Set up the sensors.
         self.recorder = Recorder()
         print("Starting camera manager!")
         self.camera_manager = CameraManager(self.client, self.world, self.recorder, self.hud, self._gamma)
-        self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.create_sensors()
         print("Camera Manager finished!")
 
@@ -173,27 +148,6 @@ class World(object):
         self._weather_index %= len(self._weather_presets)
         preset = self._weather_presets[self._weather_index]
         self.world.set_weather(preset[0])
-
-    def next_map_layer(self, reverse=False):
-        self.current_map_layer += -1 if reverse else 1
-        self.current_map_layer %= len(self.map_layer_names)
-        selected = self.map_layer_names[self.current_map_layer]
-
-    def load_map_layer(self, unload=False):
-        selected = self.map_layer_names[self.current_map_layer]
-        if unload:
-            self.world.unload_map_layer(selected)
-        else:
-            self.world.load_map_layer(selected)
-
-    def modify_vehicle_physics(self, actor):
-        #If actor is not a vehicle, we cannot use the physics control
-        try:
-            physics_control = actor.get_physics_control()
-            physics_control.use_sweep_wheel_collision = True
-            actor.apply_physics_control(physics_control)
-        except Exception:
-            pass
 
     def tick(self, clock):
         self.hud.tick(self, clock)
@@ -363,7 +317,7 @@ class CameraManager(object):
         original_transform = selected_waypoint.transform
         location = original_transform.location
         rotation = original_transform.rotation
-        transform = carla.Transform(carla.Location(location.x, location.y, location.z + 20), carla.Rotation(rotation.pitch + random.uniform(-15.0, 15.0), rotation.yaw + random.uniform(-15.0, 15.0), rotation.roll + random.uniform(-15.0, 15.0)))
+        transform = carla.Transform(carla.Location(location.x + random.uniform(-2.0, 2.0), location.y + random.uniform(-2.0, 2.0), location.z + 20 + random.uniform(-5.0, 5.0)), carla.Rotation(rotation.pitch + random.uniform(-5.0, 5.0), rotation.yaw + random.uniform(-5.0, 5.0), rotation.roll + random.uniform(-5.0, 5.0)))
 
         batch = []
         for index in range(len(self.sensors)):
@@ -601,7 +555,7 @@ class Recorder(object):
         self.image_index = Value('i', 0)
         self.video_index = Value('i', 0)
         self.input_queue = Queue()
-        self.record_process = Process(target=Recorder.record_thread, args=(self.input_queue, self.image_index, self.video_index))
+        self.record_process = Process(target=Recorder.record_thread, args=(self.input_queue, self.image_index, self.video_index, self.coco_lock))
         self.initialize_coco()
         shutil.rmtree("output/", ignore_errors=True)
         os.makedirs("output/", exist_ok=False)
@@ -609,10 +563,10 @@ class Recorder(object):
         print("Started recorder")
 
     @staticmethod
-    def record_thread(input_queue, image_index, video_index):
+    def record_thread(input_queue, image_index, video_index, coco_lock):
         while True:
-            array, objs = input_queue.get(block=True)
-            
+            array, objs, base_image = input_queue.get(block=True)
+            coco_lock.acquire()
             for track_id in objs:
                 bbox = objs[track_id]
                 y_min = bbox["min_h"]
@@ -627,9 +581,10 @@ class Recorder(object):
             #array = array[:, :, ::-1]
             os.makedirs("output/%08d" % video_index.value, exist_ok=True)
             cv2.imwrite("output/%08d/%08d.png" % (video_index.value, image_index.value), array)
-            #cv2.imwrite("output/%08d/%08d_debug.png" % (video_index.value, image_index.value), segmentation["base_image"])
+            cv2.imwrite("output/%08d/%08d_debug.png" % (video_index.value, image_index.value), base_image)
             #image.save_to_disk('_out/%08d' % image.frame)
             image_index.value += 1
+            coco_lock.release()
 
     def record_entry(self, array, segmentation):
         semantic_array = segmentation["semantic_array"]
@@ -652,7 +607,7 @@ class Recorder(object):
                         objs[track_id]["min_h"] = h
                     elif h > objs[track_id]["max_h"]:
                         objs[track_id]["max_h"] = h
-        self.input_queue.put((array, objs))
+        self.input_queue.put((array, objs, segmentation["base_image"]))
         self.add_coco_entry(objs, segmentation["width"], segmentation["height"])
 
     def initialize_coco(self):
@@ -668,7 +623,7 @@ class Recorder(object):
 
     def add_coco_entry(self, objs, width, height):
         self.coco_lock.acquire()
-        image_entry = {"id": int(self.coco_image_index), "width": float(width), "height": float(height), "file_name": "%08d/%08d.png" % (self.video_index.value, self.coco_image_index)}
+        image_entry = {"video": int(self.video_index.value), "id": int(self.coco_image_index), "width": float(width), "height": float(height), "file_name": "%08d/%08d.png" % (self.video_index.value, self.coco_image_index)}
         self.coco_data["images"].append(image_entry)
         for track_id in objs:
             bbox = objs[track_id]
@@ -681,9 +636,16 @@ class Recorder(object):
         self.coco_image_index += 1
         self.coco_lock.release()
 
+    def new_video(self):
+        self.coco_lock.acquire()
+        self.video_index.value += 1
+        self.coco_lock.release()
+
     def save_coco(self):
+        self.coco_lock.acquire()
         with open("output/coco.json", "w+") as f:
             json.dump(self.coco_data, f, indent=4)
+        self.coco_lock.release()
 
     def destroy(self):
         self.record_process.terminate()
@@ -717,9 +679,9 @@ def game_loop(args):
             settings = sim_world.get_settings()
             if not settings.synchronous_mode:
                 settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 0.05
+                settings.fixed_delta_seconds = 1.0/float(args.fps)
             else:
-                settings.fixed_delta_seconds = 0.05
+                settings.fixed_delta_seconds = 1.0/float(args.fps)
             sim_world.apply_settings(settings)
 
             traffic_manager.set_synchronous_mode(True)
