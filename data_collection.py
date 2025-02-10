@@ -252,7 +252,7 @@ class CameraManager(object):
  
         self.client = client
         self.world = world
-        #self.waypoints = world.generate_waypoints(0.1)
+        self.waypoints = world.get_map().generate_waypoints(1.0)
 
         print("Goodies loaded up!")
 
@@ -297,7 +297,7 @@ class CameraManager(object):
                     self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 0))
                 else:
                     self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 1))
-                
+        self.switch_waypoints()
 
     @staticmethod
     def _parse_image(weak_self, image, index):
@@ -356,20 +356,21 @@ class CameraManager(object):
 
         self.recorder.record_entry(array, objs)
 
-    def switch_waypoints():
-        pass
-        """
+    def switch_waypoints(self):
         selected_waypoint = self.waypoints[0]
-        self.waypoints = selected_waypoint.next(0.1)
+        self.waypoints = selected_waypoint.next(0.5)
         ApplyTransform = carla.command.ApplyTransform
+        original_transform = selected_waypoint.transform
+        location = original_transform.location
+        rotation = original_transform.rotation
+        transform = carla.Transform(carla.Location(location.x, location.y, location.z + 20), carla.Rotation(rotation.pitch + random.uniform(-15.0, 15.0), rotation.yaw + random.uniform(-15.0, 15.0), rotation.roll + random.uniform(-15.0, 15.0)))
 
         batch = []
         for index in range(len(self.sensors)):
             actor_id = self.sensors[index][3].id
-            batch.append(ApplyTransform(actor_id, selected_waypoint.transform))
+            batch.append(ApplyTransform(actor_id, transform))
         
         self.client.apply_batch_sync(batch, False)
-        """
 
     def tick(self):
         self.switch_waypoints()
@@ -741,12 +742,10 @@ def game_loop(args):
                 sim_world.tick()
             clock.tick_busy_loop(60)
             world.tick(clock)
-            print("ticking")
 
     except Exception as e:
         print("EXCEPTION: ", e.message)
     finally:
-        print("doing shut down!")
         traffic.destroy()
         traffic_manager.shut_down()
 
