@@ -112,6 +112,8 @@ class World(object):
         self.sync = args.sync
         self.traffic_manager = traffic_manager
         self.actor_role_name = args.rolename
+        self.total_ticks = 0
+        self.switch_frequency = args.switch
         try:
             self.map = self.world.get_map()
         except RuntimeError as error:
@@ -120,7 +122,6 @@ class World(object):
             print('  Make sure it exists, has the same name of your town, and is correct.')
             sys.exit(1)
         self.hud = hud
-        self.player = None
         self.camera_manager = None
         self.recorder = None
         self._weather_presets = find_weather_presets()
@@ -130,7 +131,6 @@ class World(object):
         self._gamma = args.gamma
         self.restart()
         self.world.on_tick(hud.on_world_tick)
-        self.recording_enabled = False
         self.recording_start = 0
         self.constant_velocity_enabled = False
         self.show_vehicle_telemetry = False
@@ -151,59 +151,15 @@ class World(object):
         ]
 
     def restart(self):
-        self.player_max_speed = 1.589
-        self.player_max_speed_fast = 3.713
         # Keep same camera config if the camera manager exists.
         cam_index = self.camera_manager.index if self.camera_manager is not None else 0
         cam_pos_index = self.camera_manager.transform_index if self.camera_manager is not None else 0
-        # Get a random blueprint.
-        blueprint_list = get_actor_blueprints(self.world, self._actor_filter, self._actor_generation)
-        if not blueprint_list:
-            raise ValueError("Couldn't find any blueprints with the specified filters")
-        blueprint = random.choice(blueprint_list)
-        blueprint.set_attribute('role_name', self.actor_role_name)
-        if blueprint.has_attribute('terramechanics'):
-            blueprint.set_attribute('terramechanics', 'true')
-        if blueprint.has_attribute('color'):
-            color = random.choice(blueprint.get_attribute('color').recommended_values)
-            blueprint.set_attribute('color', color)
-        if blueprint.has_attribute('driver_id'):
-            driver_id = random.choice(blueprint.get_attribute('driver_id').recommended_values)
-            blueprint.set_attribute('driver_id', driver_id)
-        if blueprint.has_attribute('is_invincible'):
-            blueprint.set_attribute('is_invincible', 'true')
-        # set the max speed
-        if blueprint.has_attribute('speed'):
-            self.player_max_speed = float(blueprint.get_attribute('speed').recommended_values[1])
-            self.player_max_speed_fast = float(blueprint.get_attribute('speed').recommended_values[2])
 
-        # Spawn the player.
-        if self.player is not None:
-            spawn_point = self.player.get_transform()
-            spawn_point.location.z += 2.0
-            spawn_point.rotation.roll = 0.0
-            spawn_point.rotation.pitch = 0.0
-            self.destroy()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-            self.show_vehicle_telemetry = False
-            self.modify_vehicle_physics(self.player)
-        while self.player is None:
-            if not self.map.get_spawn_points():
-                print('There are no spawn points available in your map/town.')
-                print('Please add some Vehicle Spawn Point to your UE5 scene.')
-                sys.exit(1)
-            spawn_points = self.map.get_spawn_points()
-            spawn_point = random.choice(spawn_points) if spawn_points else carla.Transform()
-            self.player = self.world.try_spawn_actor(blueprint, spawn_point)
-            self.show_vehicle_telemetry = False
-            self.modify_vehicle_physics(self.player)
         # Set up the sensors.
         self.recorder = Recorder()
-        self.camera_manager = CameraManager(self.client, self.world, self.player, self.recorder, self.hud, self._gamma)
+        self.camera_manager = CameraManager(self.client, self.world, self.recorder, self.hud, self._gamma)
         self.camera_manager.transform_index = cam_pos_index
         self.camera_manager.create_sensors()
-        actor_type = get_actor_display_name(self.player)
-        self.traffic_manager.update_vehicle_lights(self.player, True)
 
         if self.sync:
             self.world.tick()
@@ -240,7 +196,10 @@ class World(object):
     def tick(self, clock):
         self.hud.tick(self, clock)
         self.camera_manager.tick()
-
+        self.total_ticks += 1
+        #if ((self.total_ticks % self.switch_frequency) == 0):
+            #self.restart()
+        
     def destroy_sensors(self):
         self.camera_manager.sensor.destroy()
         self.camera_manager.sensor = None
@@ -284,9 +243,8 @@ class HUD(object):
 
 
 class CameraManager(object):
-    def __init__(self, client, world, parent_actor, recorder, hud, gamma_correction):
+    def __init__(self, client, world, recorder, hud, gamma_correction):
         self.sensor = None
-        self._parent = parent_actor
         self.hud = hud
         self.bboxes = []
         self.image = []
@@ -294,12 +252,8 @@ class CameraManager(object):
  
         self.client = client
         self.world = world
-        bound_x = 0.5 + self._parent.bounding_box.extent.x
-        bound_y = 0.5 + self._parent.bounding_box.extent.y
-        bound_z = 0.5 + self._parent.bounding_box.extent.z
-        Attachment = carla.AttachmentType
 
-        self._camera_transforms = (carla.Transform(carla.Location(x=-2.0*bound_x, y=+0.0*bound_y, z=2.0*bound_z), carla.Rotation(pitch=8.0)), Attachment.SpringArmGhost)
+        self._camera_transforms = carla.Transform(carla.Location(x=-2.0, y=+0.0, z=20.0), carla.Rotation(pitch=8.0))
 
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}, None],
@@ -323,8 +277,7 @@ class CameraManager(object):
         SpawnActor = carla.command.SpawnActor
         for index in range(len(self.sensors)):
             batch.append(SpawnActor(self.sensors[index][-1],
-                self._camera_transforms[0],
-                self._parent))
+                self._camera_transforms))
 
         responses = self.client.apply_batch_sync(batch, False)
         for index in range(len(responses)):
@@ -729,8 +682,10 @@ def game_loop(args):
 
     try:
         client = carla.Client(args.host, args.port)
+        print("Client connected")
         client.set_timeout(2000.0)
         traffic_manager = client.get_trafficmanager()
+        print("Got traffic")
         traffic = Traffic(client, traffic_manager, args)
         traffic.instantiate_traffic()
 
@@ -767,15 +722,14 @@ def game_loop(args):
             clock.tick_busy_loop(60)
             world.tick(clock)
 
+    except Exception as e:
+        print(e.message)
     finally:
     
         traffic.destroy()
 
         if original_settings:
             sim_world.apply_settings(original_settings)
-
-        if (world and world.recording_enabled):
-            client.stop_recorder()
 
         if world is not None:
             world.destroy()
@@ -789,7 +743,7 @@ def game_loop(args):
 
 
 def main():
-    argparser = argparse.ArgumentParser(description='CARLA Manual Control Client')
+    argparser = argparse.ArgumentParser(description='CARLA Data Collection Client')
     argparser.add_argument(
         '-v', '--verbose', action='store_true', dest='debug',
         help='print debug information')
@@ -826,6 +780,15 @@ def main():
     argparser.add_argument(
         '-w', '--number-of-walkers', metavar='W', default=10, type=int,
         help='Number of walkers (default: 10)')
+    argparser.add_argument(
+        '-t', '--total', metavar='T', default=86400, type=int,
+        help='Total time elapsed')
+    argparser.add_argument(
+        '-f', '--fps', metavar='F', default=20, type=int,
+        help='FPS')
+    argparser.add_argument(
+        '-s', '--switch', metavar='S', default=600, type=int,
+        help='How many seconds per map and environment switch')
     args = argparser.parse_args()
 
     args.width, args.height = [int(x) for x in args.res.split('x')]
