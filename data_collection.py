@@ -106,14 +106,16 @@ def get_actor_blueprints(world, filter, generation):
 # ==============================================================================
 
 class World(object):
-    def __init__(self, client, carla_world, hud, traffic_manager, args):
+    def __init__(self, client, carla_world, hud, args):
         self.client = client
         self.world = carla_world
         self.sync = args.sync
-        self.traffic_manager = traffic_manager
+        self.args = args
+        self.traffic_manager = None
         self.actor_role_name = args.rolename
         self.total_ticks = 0
-        self.switch_frequency = args.switch
+        self.switch_frequency = args.switch * args.fps
+        self.tick_limit = args.total * args.fps
         try:
             self.map = self.world.get_map()
         except RuntimeError as error:
@@ -122,21 +124,49 @@ class World(object):
             print('  Make sure it exists, has the same name of your town, and is correct.')
             sys.exit(1)
         self.hud = hud
+        self.traffic = None
         self.camera_manager = None
         self.recorder = None
         self._weather_presets = find_weather_presets()
+        self._maps = [map for map in self.client.get_available_maps() if "Town" in map]
         self._weather_index = 0
+        self._map_index = 0
         self._gamma = args.gamma
         self.restart()
         self.world.on_tick(hud.on_world_tick)
 
     def restart(self):
+        if self.traffic is not None:
+            self.traffic.destroy()
+            self.traffic_manager = None
+            self.traffic = None
+        if self.camera_manager is not None:
+            self.destroy_sensors()
+
+        self.world = self.client.load_world(self._maps[self._map_index], reset_settings=False)
+        if self.args.sync:
+            self.world.tick()
+        else:
+            self.world.wait_for_tick()
+        print("Map ", self._maps[self._map_index])
+        self._map_index += 1
+        self._map_index %= len(self._maps)
+        self.next_weather()
+        self.traffic_manager = self.client.get_trafficmanager()
+        self.traffic_manager.set_synchronous_mode(self.args.sync)
+        self.traffic = Traffic(self.client, self.traffic_manager, self.args)
+        self.traffic.instantiate_traffic()
         # Set up the sensors.
-        self.recorder = Recorder()
+        if self.recorder is None:
+            self.recorder = Recorder()
+        else:
+            self.recorder.new_video()
+        print("Recorder on new video!")
         print("Starting camera manager!")
         self.camera_manager = CameraManager(self.client, self.world, self.recorder, self.hud, self._gamma)
         self.camera_manager.create_sensors()
         print("Camera Manager finished!")
+ 
 
         if self.sync:
             self.world.tick()
@@ -153,22 +183,21 @@ class World(object):
         self.hud.tick(self, clock)
         self.camera_manager.tick()
         self.total_ticks += 1
-        #if ((self.total_ticks % self.switch_frequency) == 0):
-            #self.restart()
+        if ((self.total_ticks % self.switch_frequency) == 0):
+            self.restart()
+        if (self.total_ticks >= self.tick_limit):
+            self.destroy()
         
     def destroy_sensors(self):
-        self.camera_manager.sensor.destroy()
-        self.camera_manager.sensor = None
-        self.camera_manager.index = None
+        self.camera_manager.destroy()
+        self.camera_manager = None
 
     def destroy(self):
-        sensors = [
-            self.camera_manager.sensor]
-        for sensor in sensors:
-            if sensor is not None:
-                sensor.stop()
-                sensor.destroy()
+        self.destroy_sensors()
         self.recorder.destroy()
+        self.traffic.destroy()
+        self.traffic_manager.shut_down()
+        raise Exception("World has been destroyed!")
 
 # ==============================================================================
 # -- HUD -----------------------------------------------------------------------
@@ -243,6 +272,12 @@ class CameraManager(object):
                 logging.error(response.error)
             else:
                 self.sensors[index][3] = self.world.get_actor(response.actor_id)
+        self.switch_waypoints()
+        for index in range(len(responses)):
+            response = responses[index]
+            if response.error:
+                logging.error(response.error)
+            else:
                 # We need to pass the lambda a weak reference to self to avoid
                 # circular reference.
                 weak_self = weakref.ref(self)
@@ -251,7 +286,6 @@ class CameraManager(object):
                     self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 0))
                 else:
                     self.sensors[index][3].listen(lambda image: CameraManager._parse_image(weak_self, image, 1))
-        self.switch_waypoints()
 
     @staticmethod
     def _parse_image(weak_self, image, index):
@@ -311,7 +345,7 @@ class CameraManager(object):
         self.recorder.record_entry(array, objs)
 
     def switch_waypoints(self):
-        selected_waypoint = self.waypoints[0]
+        selected_waypoint = random.choice(self.waypoints)
         self.waypoints = selected_waypoint.next(0.5)
         ApplyTransform = carla.command.ApplyTransform
         original_transform = selected_waypoint.transform
@@ -330,6 +364,11 @@ class CameraManager(object):
         self.switch_waypoints()
         if (len(self.bboxes) > 0) and (len(self.image) > 0):
             self.save_data()
+
+    def destroy(self):
+        for index in range(len(self.sensors)):
+            if len(self.sensors[index]) >= 4:
+                self.sensors[index][3].destroy()
         
 
 class Traffic(object):
@@ -341,7 +380,6 @@ class Traffic(object):
         self.walkers_list = []
         self.all_id = []
         self.synchronous_master = False
-        random.seed(1007)
         
     def get_actor_blueprints(self, world, filter, generation):
         bps = world.get_blueprint_library().filter(filter)
@@ -374,21 +412,16 @@ class Traffic(object):
         traffic_manager = self.traffic_manager
 
         traffic_manager.set_global_distance_to_leading_vehicle(2.5)
-        traffic_manager.set_random_device_seed(1007)
 
         settings = world.get_settings()
         if args.sync:
             traffic_manager.set_synchronous_mode(True)
             if not settings.synchronous_mode:
                 self.synchronous_master = True
-                settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 0.05
             else:
                 self.synchronous_master = False
         else:
             print("You are currently in asynchronous mode, and traffic might experience some issues")
-
-        world.apply_settings(settings)
 
         blueprints = self.get_actor_blueprints(world, "vehicle.*", "All")
         if not blueprints:
@@ -477,7 +510,7 @@ class Traffic(object):
                 print("Walker has no speed")
                 walker_speed.append(0.0)
             batch.append(SpawnActor(walker_bp, spawn_point))
-        results = client.apply_batch_sync(batch, True)
+        results = client.apply_batch_sync(batch, False)
         walker_speed2 = []
         for i in range(len(results)):
             if results[i].error:
@@ -491,7 +524,7 @@ class Traffic(object):
         walker_controller_bp = world.get_blueprint_library().find('controller.ai.walker')
         for i in range(len(self.walkers_list)):
             batch.append(SpawnActor(walker_controller_bp, carla.Transform(), self.walkers_list[i]["id"]))
-        results = client.apply_batch_sync(batch, True)
+        results = client.apply_batch_sync(batch, False)
         for i in range(len(results)):
             if results[i].error:
                 logging.error(results[i].error)
@@ -552,41 +585,30 @@ class Recorder(object):
     def __init__(self):
         self.coco_lock = Lock()
         self.coco_image_index = 0
-        self.image_index = Value('i', 0)
-        self.video_index = Value('i', 0)
-        self.input_queue = Queue()
-        self.record_process = Process(target=Recorder.record_thread, args=(self.input_queue, self.image_index, self.video_index, self.coco_lock))
+        self.image_index = 0
+        self.video_index = 0
         self.initialize_coco()
         shutil.rmtree("output/", ignore_errors=True)
         os.makedirs("output/", exist_ok=False)
-        self.record_process.start()
         print("Started recorder")
 
-    @staticmethod
-    def record_thread(input_queue, image_index, video_index, coco_lock):
-        while True:
-            array, objs, base_image = input_queue.get(block=True)
-            coco_lock.acquire()
-            for track_id in objs:
-                bbox = objs[track_id]
-                y_min = bbox["min_h"]
-                y_max = bbox["max_h"]
-                x_min = bbox["min_w"]
-                x_max = bbox["max_w"]
-                cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
-                cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-                cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
-                cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-            #array = array[:, :, :3]
-            #array = array[:, :, ::-1]
-            os.makedirs("output/%08d" % video_index.value, exist_ok=True)
-            cv2.imwrite("output/%08d/%08d.png" % (video_index.value, image_index.value), array)
-            cv2.imwrite("output/%08d/%08d_debug.png" % (video_index.value, image_index.value), base_image)
-            #image.save_to_disk('_out/%08d' % image.frame)
-            image_index.value += 1
-            coco_lock.release()
+    def add_image_entry(self, array, objs, base_image):
+        for track_id in objs:
+            bbox = objs[track_id]
+            y_min = bbox["min_h"]
+            y_max = bbox["max_h"]
+            x_min = bbox["min_w"]
+            x_max = bbox["max_w"]
+            cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
+            cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+            cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
+            cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+        os.makedirs("output/%08d" % self.video_index, exist_ok=True)
+        cv2.imwrite("output/%08d/%08d.png" % (self.video_index, self.image_index), array)
+        cv2.imwrite("output/%08d/%08d_debug.png" % (self.video_index, self.image_index), base_image)
 
     def record_entry(self, array, segmentation):
+        self.coco_lock.acquire()
         semantic_array = segmentation["semantic_array"]
         id_array = segmentation["id_array"]
         objs = {}
@@ -607,8 +629,10 @@ class Recorder(object):
                         objs[track_id]["min_h"] = h
                     elif h > objs[track_id]["max_h"]:
                         objs[track_id]["max_h"] = h
-        self.input_queue.put((array, objs, segmentation["base_image"]))
+        self.add_image_entry(array, objs, segmentation["base_image"])
         self.add_coco_entry(objs, segmentation["width"], segmentation["height"])
+        self.image_index += 1
+        self.coco_lock.release()
 
     def initialize_coco(self):
         self.coco_data = {}
@@ -620,10 +644,8 @@ class Recorder(object):
             {"supercategory": "vehicle","id": 0,"name": "vehicle"}
         ]
 
-
     def add_coco_entry(self, objs, width, height):
-        self.coco_lock.acquire()
-        image_entry = {"video": int(self.video_index.value), "id": int(self.coco_image_index), "width": float(width), "height": float(height), "file_name": "%08d/%08d.png" % (self.video_index.value, self.coco_image_index)}
+        image_entry = {"video": int(self.video_index), "id": int(self.coco_image_index), "width": float(width), "height": float(height), "file_name": "%08d/%08d.png" % (self.video_index, self.image_index)}
         self.coco_data["images"].append(image_entry)
         for track_id in objs:
             bbox = objs[track_id]
@@ -634,11 +656,12 @@ class Recorder(object):
             annotation_entry = {"id": int(track_id), "category_id": 0, "iscrowd": 0, "image_id": int(self.coco_image_index), "area": w*h, "bbox": [x, y, w, h]}
             self.coco_data["annotations"].append(annotation_entry)
         self.coco_image_index += 1
-        self.coco_lock.release()
 
     def new_video(self):
+        self.save_coco()
         self.coco_lock.acquire()
-        self.video_index.value += 1
+        self.video_index += 1
+        self.image_index = 0
         self.coco_lock.release()
 
     def save_coco(self):
@@ -648,8 +671,6 @@ class Recorder(object):
         self.coco_lock.release()
 
     def destroy(self):
-        self.record_process.terminate()
-        self.record_process.join()
         self.save_coco()
         print("Recorder stopped!")
 
@@ -662,15 +683,12 @@ def game_loop(args):
     pygame.init()
     world = None
     original_settings = None
+    random.seed(1007)
 
     try:
         client = carla.Client(args.host, args.port)
         print("Client connected")
         client.set_timeout(2000.0)
-        traffic_manager = client.get_trafficmanager()
-        print("Got traffic")
-        traffic = Traffic(client, traffic_manager, args)
-        traffic.instantiate_traffic()
 
         sim_world = client.get_world()
 
@@ -684,36 +702,28 @@ def game_loop(args):
                 settings.fixed_delta_seconds = 1.0/float(args.fps)
             sim_world.apply_settings(settings)
 
-            traffic_manager.set_synchronous_mode(True)
-
         if args.autopilot and not sim_world.get_settings().synchronous_mode:
             print("WARNING: You are currently in asynchronous mode and could "
                   "experience some issues with the traffic simulation")
 
         hud = HUD(args.width, args.height)
-        world = World(client, sim_world, hud, traffic_manager, args)
+        world = World(client, sim_world, hud, args)
 
         if args.sync:
-            sim_world.tick()
+            world.world.tick()
         else:
-            sim_world.wait_for_tick()
+            world.world.wait_for_tick()
 
         clock = pygame.time.Clock()
         while True:
             if args.sync:
-                sim_world.tick()
+                world.tick()
             clock.tick_busy_loop(60)
             world.tick(clock)
 
     except Exception as e:
         print("EXCEPTION: ", e.message)
     finally:
-        traffic.destroy()
-        traffic_manager.shut_down()
-
-        if original_settings:
-            sim_world.apply_settings(original_settings)
-
         if world is not None:
             world.destroy()
 
@@ -770,7 +780,7 @@ def main():
         '-f', '--fps', metavar='F', default=20, type=int,
         help='FPS')
     argparser.add_argument(
-        '-s', '--switch', metavar='S', default=600, type=int,
+        '-s', '--switch', metavar='S', default=5, type=int,
         help='How many seconds per map and environment switch')
     args = argparser.parse_args()
 
