@@ -128,34 +128,49 @@ class World(object):
         self.camera_manager = None
         self.recorder = None
         self._weather_presets = find_weather_presets()
-        self._maps = [map for map in self.client.get_available_maps() if "Town" in map]
-        self._weather_index = 0
+        print("Weather presets: ", self._weather_presets)
+        #self._maps = [map for map in self.client.get_available_maps() if "Town" in map]
+        self._maps = ["Town01", "Town02", "Town03", "Town04", "Town05"]#, "Town06", "Town07"]
         self._map_index = 0
         self._gamma = args.gamma
         self.restart()
         self.world.on_tick(hud.on_world_tick)
 
     def restart(self):
+        print("Beginning restart!")
         if self.traffic is not None:
+            print("Destroying traffic!")
             self.traffic.destroy()
             self.traffic_manager = None
             self.traffic = None
+            print("Traffic destroyed!")
         if self.camera_manager is not None:
+            print("Destroying sensors!")
             self.destroy_sensors()
+            print("Sensors destroyed!")
 
+        print("Creating new world!")
+        print("Map ", self._maps[self._map_index])
         self.world = self.client.load_world(self._maps[self._map_index], reset_settings=False)
+        print("World created!")
         if self.args.sync:
+            print("Doing synchronous tick!")
             self.world.tick()
         else:
+            print("Doing async tick!")
             self.world.wait_for_tick()
+        print("Tick done!")
         print("Map ", self._maps[self._map_index])
         self._map_index += 1
         self._map_index %= len(self._maps)
         self.next_weather()
+        print("Starting traffic!")
         self.traffic_manager = self.client.get_trafficmanager()
         self.traffic_manager.set_synchronous_mode(self.args.sync)
+        print("Spawning traffic!")
         self.traffic = Traffic(self.client, self.traffic_manager, self.args)
         self.traffic.instantiate_traffic()
+        print("Traffic spawned!")
         # Set up the sensors.
         if self.recorder is None:
             self.recorder = Recorder()
@@ -163,27 +178,33 @@ class World(object):
             self.recorder.new_video()
         print("Recorder on new video!")
         print("Starting camera manager!")
-        self.camera_manager = CameraManager(self.client, self.world, self.recorder, self.hud, self._gamma)
+        self.camera_manager = CameraManager(self.client, self.world, self.recorder, self.hud, self._gamma, self.args)
         self.camera_manager.create_sensors()
         print("Camera Manager finished!")
  
-
         if self.sync:
             self.world.tick()
         else:
             self.world.wait_for_tick()
+        print("New weather: ", self.world.get_weather())
 
     def next_weather(self, reverse=False):
-        self._weather_index += -1 if reverse else 1
-        self._weather_index %= len(self._weather_presets)
-        preset = self._weather_presets[self._weather_index]
+        preset = random.choice(self._weather_presets)
         self.world.set_weather(preset[0])
+        print("New weather preset: ", preset, preset[0])
 
     def tick(self, clock):
+        if self.sync:
+            self.world.tick()
+        else:
+            self.world.wait_for_tick()
         self.hud.tick(self, clock)
         self.camera_manager.tick()
         self.total_ticks += 1
+        if (self.total_ticks % int(self.args.fps) == 0):
+            print(self.total_ticks)
         if ((self.total_ticks % self.switch_frequency) == 0):
+            print("Restarting at ", self.total_ticks, " with frequnecy of ", self.switch_frequency)
             self.restart()
         if (self.total_ticks >= self.tick_limit):
             self.destroy()
@@ -226,12 +247,13 @@ class HUD(object):
 
 
 class CameraManager(object):
-    def __init__(self, client, world, recorder, hud, gamma_correction):
+    def __init__(self, client, world, recorder, hud, gamma_correction, args):
         self.sensor = None
         self.hud = hud
         self.bboxes = []
         self.image = []
         self.recorder = recorder
+        self.args = args
  
         self.client = client
         self.world = world
@@ -252,6 +274,7 @@ class CameraManager(object):
             if item[0].startswith('sensor.camera'):
                 bp.set_attribute('image_size_x', str(hud.dim[0]))
                 bp.set_attribute('image_size_y', str(hud.dim[1]))
+                bp.set_attribute('sensor_tick', str("0.05"))
                 if bp.has_attribute('gamma'):
                     bp.set_attribute('gamma', str(gamma_correction))
                 for attr_name, attr_value in item[3].items():
@@ -265,7 +288,7 @@ class CameraManager(object):
             batch.append(SpawnActor(self.sensors[index][-1],
                 self._camera_transforms))
 
-        responses = self.client.apply_batch_sync(batch, False)
+        responses = self.client.apply_batch_sync(batch, self.args.sync)
         for index in range(len(responses)):
             response = responses[index]
             if response.error:
@@ -314,7 +337,7 @@ class CameraManager(object):
             objs["semantic_array"] = semantic_array
             objs["height"] = image.height
             objs["width"] = image.width
-            self.bboxes.append((objs, image.frame_number))
+            self.bboxes.append((objs, image.frame_number, image.timestamp))
         else:
             if ((image.frame_number % 20) != 0):
                 return
@@ -325,11 +348,11 @@ class CameraManager(object):
 
             array = np.frombuffer(image.raw_data, dtype=np.dtype("uint8"))
             array = np.reshape(array, (height, width, 4)).copy()
-            self.image.append((array, image.frame_number))
+            self.image.append((array, image.frame_number, image.timestamp))
             
     def save_data(self):
-        bboxes_indices = [self.bboxes[i][1] for i in range(len(self.bboxes))]
-        image_indices = [self.image[i][1] for i in range(len(self.image))]
+        bboxes_indices = [self.bboxes[i][1:] for i in range(len(self.bboxes))]
+        image_indices = [self.image[i][1:] for i in range(len(self.image))]
         print(bboxes_indices, image_indices)
         while (self.bboxes[0][1] < self.image[0][1]):
             self.bboxes.pop(0)
@@ -346,7 +369,7 @@ class CameraManager(object):
 
     def switch_waypoints(self):
         selected_waypoint = random.choice(self.waypoints)
-        self.waypoints = selected_waypoint.next(0.5)
+        self.waypoints = selected_waypoint.next(0.1)
         ApplyTransform = carla.command.ApplyTransform
         original_transform = selected_waypoint.transform
         location = original_transform.location
@@ -368,6 +391,7 @@ class CameraManager(object):
     def destroy(self):
         for index in range(len(self.sensors)):
             if len(self.sensors[index]) >= 4:
+                self.sensors[index][3].stop()
                 self.sensors[index][3].destroy()
         
 
@@ -408,9 +432,11 @@ class Traffic(object):
     def instantiate_traffic(self):
         client = self.client
         args = self.args
+        print("Grabbing world!")
         world = client.get_world()
         traffic_manager = self.traffic_manager
 
+        print("Setting global settings.....")
         traffic_manager.set_global_distance_to_leading_vehicle(2.5)
 
         settings = world.get_settings()
@@ -510,7 +536,7 @@ class Traffic(object):
                 print("Walker has no speed")
                 walker_speed.append(0.0)
             batch.append(SpawnActor(walker_bp, spawn_point))
-        results = client.apply_batch_sync(batch, False)
+        results = client.apply_batch_sync(batch, self.synchronous_master)
         walker_speed2 = []
         for i in range(len(results)):
             if results[i].error:
@@ -524,7 +550,7 @@ class Traffic(object):
         walker_controller_bp = world.get_blueprint_library().find('controller.ai.walker')
         for i in range(len(self.walkers_list)):
             batch.append(SpawnActor(walker_controller_bp, carla.Transform(), self.walkers_list[i]["id"]))
-        results = client.apply_batch_sync(batch, False)
+        results = client.apply_batch_sync(batch, self.synchronous_master)
         for i in range(len(results)):
             if results[i].error:
                 logging.error(results[i].error)
@@ -537,10 +563,10 @@ class Traffic(object):
         self.all_actors = world.get_actors(self.all_id)
 
         # wait for a tick to ensure client receives the last transform of the walkers we have just created
-        if args.sync or not self.synchronous_master:
-            world.wait_for_tick()
-        else:
+        if args.sync:
             world.tick()
+        else:
+            world.wait_for_tick()
 
         # 5. initialize each controller and set target to walk to (list is [controler, actor, controller, actor ...])
         # set how many pedestrians can cross the road
@@ -599,10 +625,10 @@ class Recorder(object):
             y_max = bbox["max_h"]
             x_min = bbox["min_w"]
             x_max = bbox["max_w"]
-            cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
-            cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
-            cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
-            cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+            #cv2.line(array, (int(x_min),int(y_min)), (int(x_max),int(y_min)), (0,0,255, 255), 1)
+            #cv2.line(array, (int(x_min),int(y_max)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
+            #cv2.line(array, (int(x_min),int(y_min)), (int(x_min),int(y_max)), (0,0,255, 255), 1)
+            #cv2.line(array, (int(x_max),int(y_min)), (int(x_max),int(y_max)), (0,0,255, 255), 1)
         os.makedirs("output/%08d" % self.video_index, exist_ok=True)
         cv2.imwrite("output/%08d/%08d.png" % (self.video_index, self.image_index), array)
         cv2.imwrite("output/%08d/%08d_debug.png" % (self.video_index, self.image_index), base_image)
@@ -697,9 +723,13 @@ def game_loop(args):
             settings = sim_world.get_settings()
             if not settings.synchronous_mode:
                 settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 1.0/float(args.fps)
-            else:
-                settings.fixed_delta_seconds = 1.0/float(args.fps)
+            settings.fixed_delta_seconds = 1.0/float(args.fps)
+
+            sim_world.apply_settings(settings)
+        else:
+            settings = sim_world.get_settings()
+            settings.fixed_delta_seconds = 1.0/float(args.fps)
+            settings.synchronous_mode = False
             sim_world.apply_settings(settings)
 
         if args.autopilot and not sim_world.get_settings().synchronous_mode:
@@ -716,9 +746,6 @@ def game_loop(args):
 
         clock = pygame.time.Clock()
         while True:
-            if args.sync:
-                world.tick()
-            clock.tick_busy_loop(60)
             world.tick(clock)
 
     except Exception as e:
@@ -768,11 +795,11 @@ def main():
         '--sync', action='store_true',
         help='Activate synchronous mode execution')
     argparser.add_argument(
-        '-n', '--number-of-vehicles', metavar='N', default=30, type=int,
-        help='Number of vehicles (default: 30)')
+        '-n', '--number-of-vehicles', metavar='N', default=50, type=int,
+        help='Number of vehicles (default: 50)')
     argparser.add_argument(
-        '-w', '--number-of-walkers', metavar='W', default=10, type=int,
-        help='Number of walkers (default: 10)')
+        '-w', '--number-of-walkers', metavar='W', default=20, type=int,
+        help='Number of walkers (default: 20)')
     argparser.add_argument(
         '-t', '--total', metavar='T', default=86400, type=int,
         help='Total time elapsed')
@@ -780,7 +807,7 @@ def main():
         '-f', '--fps', metavar='F', default=20, type=int,
         help='FPS')
     argparser.add_argument(
-        '-s', '--switch', metavar='S', default=5, type=int,
+        '-s', '--switch', metavar='S', default=600, type=int,
         help='How many seconds per map and environment switch')
     args = argparser.parse_args()
 
