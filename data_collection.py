@@ -17,7 +17,11 @@ import time
 import cv2
 import copy
 import shutil
+import socket
+import subprocess
 import json
+import signal
+import importlib
 from multiprocessing import Queue, Process, Value, Lock
 
 try:
@@ -67,7 +71,7 @@ OBJECT_TO_COLOR = [
 # ==============================================================================
 
 
-def find_weather_presets():
+def find_weather_presets(carla):
     rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')
     name = lambda x: ' '.join(m.group(0) for m in rgx.finditer(x))
     presets = [x for x in dir(carla.WeatherParameters) if re.match('[A-Z].+', x)]
@@ -101,14 +105,45 @@ def get_actor_blueprints(world, filter, generation):
         print("   Warning! Actor Generation is not valid. No actor will be spawned.")
         return []
 
+def wait_for_port(host, port, timeout=60, check_interval=1):
+    start_time = time.time()
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except (socket.timeout, ConnectionRefusedError):
+            if time.time() - start_time > timeout:
+                return False
+            time.sleep(check_interval)
+
+def wait_for_port_down(host, port, timeout=60, check_interval=1):
+    start_time = time.time()
+    while True:
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                if time.time() - start_time > timeout:
+                    time.sleep(check_interval)
+        except (socket.timeout, ConnectionRefusedError):
+                return True
+    return False       
+
+def kill(proc_pid):
+    process = psutil.Process(proc_pid)
+    for proc in process.children(recursive=True):
+        proc.kill()
+    process.kill()
+
 # ==============================================================================
 # -- World ---------------------------------------------------------------------
 # ==============================================================================
 
 class World(object):
-    def __init__(self, client, carla_world, hud, args):
-        self.client = client
-        self.world = carla_world
+    def __init__(self, hud, args):
+        self.carla = None
+        self.load_carla()
+        self.server_process = None
+        self.client = None
+        self.world = None
         self.sync = args.sync
         self.args = args
         self.traffic_manager = None
@@ -116,25 +151,76 @@ class World(object):
         self.total_ticks = 0
         self.switch_frequency = args.switch * args.fps
         self.tick_limit = args.total * args.fps
-        try:
-            self.map = self.world.get_map()
-        except RuntimeError as error:
-            print('RuntimeError: {}'.format(error))
-            print('  The server could not send the OpenDRIVE (.xodr) file:')
-            print('  Make sure it exists, has the same name of your town, and is correct.')
-            sys.exit(1)
         self.hud = hud
         self.traffic = None
         self.camera_manager = None
         self.recorder = None
-        self._weather_presets = find_weather_presets()
+        self._weather_presets = find_weather_presets(self.carla)
         print("Weather presets: ", self._weather_presets)
         #self._maps = [map for map in self.client.get_available_maps() if "Town" in map]
-        self._maps = ["Town01", "Town02", "Town03", "Town04", "Town05"]#, "Town06", "Town07"]
+        self._maps = ["Town01", "Town02", "Town03", "Town04"]#, "Town06", "Town07"]
         self._map_index = 0
         self._gamma = args.gamma
         self.restart()
-        self.world.on_tick(hud.on_world_tick)
+
+    def load_carla(self):
+        if self.carla is not None:
+            self.carla = importlib.reload(self.carla)
+        else:
+            self.carla = importlib.import_module("carla")
+
+    def kill_server(self):
+        if self.server_process is None:
+            return
+        os.killpg(os.getpgid(self.server_process.pid), signal.SIGKILL)
+        wait_for_port_down("localhost", 2000)
+        print("Server killed!")
+        self.server_process = None
+
+    def spawn_server(self):
+        self.server_process = subprocess.Popen("DISPLAY=:1 /home/richarwa/Carla-UE4-Dev-Linux-Shipping/CarlaUE4.sh -fps 20", stdout=subprocess.PIPE, shell=True, preexec_fn=os.setsid)
+        if wait_for_port("localhost", 2000):
+            print("Server available!")
+        else:
+            print("Server not available!")
+            raise Exception("Server not available!")
+
+    def spawn_client(self):
+        if self.client is not None:
+            del self.client
+            self.client = None
+        self.client = self.carla.Client(self.args.host, self.args.port)
+        print("Client connected")
+        self.client.set_timeout(5.0)
+        print("Timeout set!")
+
+        try:
+            self.world = self.client.get_world()
+            if self.args.sync:
+                original_settings = self.world.get_settings()
+                settings = self.world.get_settings()
+                if not settings.synchronous_mode:
+                    settings.synchronous_mode = True
+                settings.fixed_delta_seconds = 1.0/float(self.args.fps)
+
+                self.world.apply_settings(settings)
+            else:
+                settings = self.world.get_settings()
+                settings.fixed_delta_seconds = 1.0/float(self.args.fps)
+                settings.synchronous_mode = False
+                self.world.apply_settings(settings)
+        except:
+            print("Restarting client")
+            self.spawn_client()
+        print("Client setup!")
+        
+
+    def respawn_server_and_client(self):
+        if self.server_process is not None:
+            self.kill_server()
+        self.load_carla()
+        self.spawn_server()
+        self.spawn_client()
 
     def restart(self):
         print("Beginning restart!")
@@ -151,6 +237,7 @@ class World(object):
 
         print("Creating new world!")
         print("Map ", self._maps[self._map_index])
+        self.respawn_server_and_client()
         self.world = self.client.load_world(self._maps[self._map_index], reset_settings=False)
         print("World created!")
         if self.args.sync:
@@ -168,7 +255,7 @@ class World(object):
         self.traffic_manager = self.client.get_trafficmanager()
         self.traffic_manager.set_synchronous_mode(self.args.sync)
         print("Spawning traffic!")
-        self.traffic = Traffic(self.client, self.traffic_manager, self.args)
+        self.traffic = Traffic(self.carla, self.client, self.traffic_manager, self.args)
         self.traffic.instantiate_traffic()
         print("Traffic spawned!")
         # Set up the sensors.
@@ -178,7 +265,7 @@ class World(object):
             self.recorder.new_video()
         print("Recorder on new video!")
         print("Starting camera manager!")
-        self.camera_manager = CameraManager(self.client, self.world, self.recorder, self.hud, self._gamma, self.args)
+        self.camera_manager = CameraManager(self.carla, self.client, self.world, self.recorder, self.hud, self._gamma, self.args)
         self.camera_manager.create_sensors()
         print("Camera Manager finished!")
  
@@ -187,18 +274,19 @@ class World(object):
         else:
             self.world.wait_for_tick()
         print("New weather: ", self.world.get_weather())
+        self.world.on_tick(self.hud.on_world_tick)
 
     def next_weather(self, reverse=False):
         preset = random.choice(self._weather_presets)
         self.world.set_weather(preset[0])
         print("New weather preset: ", preset, preset[0])
 
-    def tick(self, clock):
+    def tick(self):
         if self.sync:
             self.world.tick()
         else:
             self.world.wait_for_tick()
-        self.hud.tick(self, clock)
+        self.hud.tick(self)
         self.camera_manager.tick()
         self.total_ticks += 1
         if (self.total_ticks % int(self.args.fps) == 0):
@@ -218,6 +306,7 @@ class World(object):
         self.recorder.destroy()
         self.traffic.destroy()
         self.traffic_manager.shut_down()
+        self.kill_server()
         raise Exception("World has been destroyed!")
 
 # ==============================================================================
@@ -238,7 +327,7 @@ class HUD(object):
         self.frame = timestamp.frame
         self.simulation_time = timestamp.elapsed_seconds
 
-    def tick(self, world, clock):
+    def tick(self, world):
         pass
 
 # ==============================================================================
@@ -247,7 +336,8 @@ class HUD(object):
 
 
 class CameraManager(object):
-    def __init__(self, client, world, recorder, hud, gamma_correction, args):
+    def __init__(self, carla, client, world, recorder, hud, gamma_correction, args):
+        self.carla = carla
         self.sensor = None
         self.hud = hud
         self.bboxes = []
@@ -261,7 +351,7 @@ class CameraManager(object):
 
         print("Goodies loaded up!")
 
-        self._camera_transforms = carla.Transform(carla.Location(x=-2.0, y=+0.0, z=20.0), carla.Rotation(pitch=8.0))
+        self._camera_transforms = self.carla.Transform(self.carla.Location(x=-2.0, y=+0.0, z=20.0), self.carla.Rotation(pitch=8.0))
 
         self.sensors = [
             ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}, None],
@@ -283,7 +373,7 @@ class CameraManager(object):
 
     def create_sensors(self):
         batch = []
-        SpawnActor = carla.command.SpawnActor
+        SpawnActor = self.carla.command.SpawnActor
         for index in range(len(self.sensors)):
             batch.append(SpawnActor(self.sensors[index][-1],
                 self._camera_transforms))
@@ -370,11 +460,11 @@ class CameraManager(object):
     def switch_waypoints(self):
         selected_waypoint = random.choice(self.waypoints)
         self.waypoints = selected_waypoint.next(0.1)
-        ApplyTransform = carla.command.ApplyTransform
+        ApplyTransform = self.carla.command.ApplyTransform
         original_transform = selected_waypoint.transform
         location = original_transform.location
         rotation = original_transform.rotation
-        transform = carla.Transform(carla.Location(location.x + random.uniform(-2.0, 2.0), location.y + random.uniform(-2.0, 2.0), location.z + 20 + random.uniform(-5.0, 5.0)), carla.Rotation(rotation.pitch + random.uniform(-5.0, 5.0), rotation.yaw + random.uniform(-5.0, 5.0), rotation.roll + random.uniform(-5.0, 5.0)))
+        transform = self.carla.Transform(self.carla.Location(location.x + random.uniform(-2.0, 2.0), location.y + random.uniform(-2.0, 2.0), location.z + 20 + random.uniform(-5.0, 5.0)), self.carla.Rotation(rotation.pitch + random.uniform(-5.0, 5.0), rotation.yaw + random.uniform(-5.0, 5.0), rotation.roll + random.uniform(-5.0, 5.0)))
 
         batch = []
         for index in range(len(self.sensors)):
@@ -396,7 +486,8 @@ class CameraManager(object):
         
 
 class Traffic(object):
-    def __init__(self, client, traffic_manager, args):
+    def __init__(self, carla, client, traffic_manager, args):
+        self.carla = carla
         self.client = client
         self.args = args
         self.traffic_manager = traffic_manager
@@ -469,9 +560,9 @@ class Traffic(object):
             args.number_of_vehicles = number_of_spawn_points
 
         # @todo cannot import these directly.
-        SpawnActor = carla.command.SpawnActor
-        SetAutopilot = carla.command.SetAutopilot
-        FutureActor = carla.command.FutureActor
+        SpawnActor = self.carla.command.SpawnActor
+        SetAutopilot = self.carla.command.SetAutopilot
+        FutureActor = self.carla.command.FutureActor
 
         # --------------
         # Spawn vehicles
@@ -509,7 +600,7 @@ class Traffic(object):
         # 1. take all the random locations to spawn
         spawn_points = []
         for i in range(args.number_of_walkers):
-            spawn_point = carla.Transform()
+            spawn_point = self.carla.Transform()
             loc = world.get_random_location_from_navigation()
             if (loc != None):
                 spawn_point.location = loc
@@ -549,7 +640,7 @@ class Traffic(object):
         batch = []
         walker_controller_bp = world.get_blueprint_library().find('controller.ai.walker')
         for i in range(len(self.walkers_list)):
-            batch.append(SpawnActor(walker_controller_bp, carla.Transform(), self.walkers_list[i]["id"]))
+            batch.append(SpawnActor(walker_controller_bp, self.carla.Transform(), self.walkers_list[i]["id"]))
         results = client.apply_batch_sync(batch, self.synchronous_master)
         for i in range(len(results)):
             if results[i].error:
@@ -593,14 +684,14 @@ class Traffic(object):
             world.apply_settings(settings)
 
         print('\ndestroying %d vehicles' % len(self.vehicles_list))
-        self.client.apply_batch([carla.command.DestroyActor(x) for x in self.vehicles_list])
+        self.client.apply_batch([self.carla.command.DestroyActor(x) for x in self.vehicles_list])
 
         # stop walker controllers (list is [controller, actor, controller, actor ...])
         for i in range(0, len(self.all_id), 2):
             self.all_actors[i].stop()
 
         print('\ndestroying %d walkers' % len(self.walkers_list))
-        self.client.apply_batch([carla.command.DestroyActor(x) for x in self.all_id])
+        self.client.apply_batch([self.carla.command.DestroyActor(x) for x in self.all_id])
 
         time.sleep(0.5)
 
@@ -712,41 +803,10 @@ def game_loop(args):
     random.seed(1007)
 
     try:
-        client = carla.Client(args.host, args.port)
-        print("Client connected")
-        client.set_timeout(2000.0)
-
-        sim_world = client.get_world()
-
-        if args.sync:
-            original_settings = sim_world.get_settings()
-            settings = sim_world.get_settings()
-            if not settings.synchronous_mode:
-                settings.synchronous_mode = True
-            settings.fixed_delta_seconds = 1.0/float(args.fps)
-
-            sim_world.apply_settings(settings)
-        else:
-            settings = sim_world.get_settings()
-            settings.fixed_delta_seconds = 1.0/float(args.fps)
-            settings.synchronous_mode = False
-            sim_world.apply_settings(settings)
-
-        if args.autopilot and not sim_world.get_settings().synchronous_mode:
-            print("WARNING: You are currently in asynchronous mode and could "
-                  "experience some issues with the traffic simulation")
-
         hud = HUD(args.width, args.height)
-        world = World(client, sim_world, hud, args)
-
-        if args.sync:
-            world.world.tick()
-        else:
-            world.world.wait_for_tick()
-
-        clock = pygame.time.Clock()
+        world = World(hud, args)
         while True:
-            world.tick(clock)
+            world.tick()
 
     except Exception as e:
         print("EXCEPTION: ", e.message)
@@ -807,7 +867,7 @@ def main():
         '-f', '--fps', metavar='F', default=20, type=int,
         help='FPS')
     argparser.add_argument(
-        '-s', '--switch', metavar='S', default=600, type=int,
+        '-s', '--switch', metavar='S', default=5, type=int,
         help='How many seconds per map and environment switch')
     args = argparser.parse_args()
 
