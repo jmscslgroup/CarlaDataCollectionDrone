@@ -126,7 +126,7 @@ def kill(proc_pid):
 
 class Manager(object):
     def __init__(self, args):
-        self.args = None
+        self.args = args
         self.carla = None
         self.load_carla()
         self.recorder = Recorder()
@@ -139,7 +139,7 @@ class Manager(object):
         self._map_index = 0
         self.episode_runs = 0
         self.episode_max = int(args.total / args.switch)
-        self.episode_running
+        self.episode_running = False
 
     def load_carla(self):
         if self.carla is not None:
@@ -167,10 +167,11 @@ class Manager(object):
         self.episode_process.start()
 
     def consume_episode_data(self):
-        data = self.output_queue.get(timeout=0.1)
+        data = self.output_queue.get()
         if data is None:
             self.episode_running = False
             self.input_queue.close()
+            return
         array, objs = data
         self.recorder.record_entry(array, objs)
     
@@ -278,9 +279,9 @@ class World(object):
     def start(self):
         print("Beginning start!")
         print("Creating new world!")
-        print("Map ", self._maps[self._map_index])
+        print("Map ", self.carla_map)
         self.spawn_server_and_client()
-        self.world = self.client.load_world(self._maps[self._map_index], reset_settings=False)
+        self.world = self.client.load_world(self.carla_map, reset_settings=False)
         print("World created!")
         if self.args.sync:
             print("Doing synchronous tick!")
@@ -290,7 +291,7 @@ class World(object):
             self.world.wait_for_tick()
         print("Tick done!")
         print("Map ", self.carla_map)
-        self.world.set_weather(self.weather)
+        self.world.set_weather(self.weather[0])
         print("Starting traffic!")
         self.traffic_manager = self.client.get_trafficmanager()
         self.traffic_manager.set_synchronous_mode(self.args.sync)
@@ -327,7 +328,6 @@ class World(object):
 
     def destroy(self):
         self.destroy_sensors()
-        self.recorder.destroy()
         self.traffic.destroy()
         self.traffic_manager.shut_down()
         self.kill_server()
@@ -804,10 +804,8 @@ def game_loop(args):
     random.seed(1007)
 
     try:
-        world = World(args)
-        while True:
-            world.tick()
-
+        manager = Manager(args)
+        manager.loop()
     except Exception as e:
         print("EXCEPTION: ", e.message)
     finally:
@@ -865,7 +863,7 @@ def main():
         '-f', '--fps', metavar='F', default=20, type=int,
         help='FPS')
     argparser.add_argument(
-        '-s', '--switch', metavar='S', default=5, type=int,
+        '-s', '--switch', metavar='S', default=600, type=int,
         help='How many seconds per map and environment switch')
     args = argparser.parse_args()
 
