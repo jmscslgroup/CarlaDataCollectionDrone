@@ -1,9 +1,5 @@
 #!/usr/bin/env python
 
-import carla
-
-from carla import ColorConverter as cc
-
 import argparse
 import collections
 import datetime
@@ -23,11 +19,6 @@ import json
 import signal
 import importlib
 from multiprocessing import Queue, Process, Value, Lock
-
-try:
-    import pygame
-except ImportError:
-    raise RuntimeError('cannot import pygame, make sure pygame package is installed')
 
 try:
     import numpy as np
@@ -133,12 +124,79 @@ def kill(proc_pid):
         proc.kill()
     process.kill()
 
+class Manager(object):
+    def __init__(self, args):
+        self.args = None
+        self.carla = None
+        self.load_carla()
+        self.recorder = Recorder()
+        self.input_queue = None
+        self.output_queue = None
+        self._weather_presets = find_weather_presets(self.carla)
+        print("Weather presets: ", self._weather_presets)
+        #self._maps = [map for map in self.client.get_available_maps() if "Town" in map]
+        self._maps = ["Town01", "Town02", "Town03", "Town04"]#, "Town06", "Town07"]
+        self._map_index = 0
+        self.episode_runs = 0
+        self.episode_max = int(args.total / args.switch)
+        self.episode_running
+
+    def load_carla(self):
+        if self.carla is not None:
+            self.carla = importlib.reload(self.carla)
+        else:
+            self.carla = importlib.import_module("carla")
+
+    @staticmethod
+    def _episode_launch_thread(args, weather, carla_map, input_queue, output_queue):
+        total_ticks = args.switch * args.fps
+        world = World(args, weather, carla_map, input_queue, output_queue)
+        for i in range(total_ticks):
+            world.tick()
+        world.destroy()
+        output_queue.put(None)
+        output_queue.close()
+
+    def launch_episode(self):
+        self.input_queue = Queue()
+        self.output_queue = Queue()
+        preset = random.choice(self._weather_presets)
+        carla_map = self._maps[self._map_index]
+        self.episode_process = Process(target=Manager._episode_launch_thread, args=(self.args, preset, carla_map, self.input_queue, self.output_queue))
+        self.episode_running = True
+        self.episode_process.start()
+
+    def consume_episode_data(self):
+        data = self.output_queue.get(timeout=0.1)
+        if data is None:
+            self.episode_running = False
+            self.input_queue.close()
+        array, objs = data
+        self.recorder.record_entry(array, objs)
+    
+    def kill_episode(self):
+        self.episode_process.kill()
+        self.episode_running = False
+        self.input_queue = None 
+        self.output_queue = None
+        self.episode_runs += 1
+        self._map_index += 1
+        self._map_index %= len(self._maps)
+
+    def loop(self):
+        while self.episode_runs < self.episode_max:
+            self.launch_episode()
+            while self.episode_running:
+                self.consume_episode_data()
+            self.kill_episode()
+            self.recorder.new_video()
+
 # ==============================================================================
 # -- World ---------------------------------------------------------------------
 # ==============================================================================
 
 class World(object):
-    def __init__(self, hud, args):
+    def __init__(self, args):
         self.carla = None
         self.load_carla()
         self.server_process = None
@@ -151,7 +209,6 @@ class World(object):
         self.total_ticks = 0
         self.switch_frequency = args.switch * args.fps
         self.tick_limit = args.total * args.fps
-        self.hud = hud
         self.traffic = None
         self.camera_manager = None
         self.recorder = None
@@ -265,7 +322,7 @@ class World(object):
             self.recorder.new_video()
         print("Recorder on new video!")
         print("Starting camera manager!")
-        self.camera_manager = CameraManager(self.carla, self.client, self.world, self.recorder, self.hud, self._gamma, self.args)
+        self.camera_manager = CameraManager(self.carla, self.client, self.world, self.recorder, self._gamma, self.args)
         self.camera_manager.create_sensors()
         print("Camera Manager finished!")
  
@@ -274,7 +331,6 @@ class World(object):
         else:
             self.world.wait_for_tick()
         print("New weather: ", self.world.get_weather())
-        self.world.on_tick(self.hud.on_world_tick)
 
     def next_weather(self, reverse=False):
         preset = random.choice(self._weather_presets)
@@ -286,7 +342,6 @@ class World(object):
             self.world.tick()
         else:
             self.world.wait_for_tick()
-        self.hud.tick(self)
         self.camera_manager.tick()
         self.total_ticks += 1
         if (self.total_ticks % int(self.args.fps) == 0):
@@ -310,36 +365,14 @@ class World(object):
         raise Exception("World has been destroyed!")
 
 # ==============================================================================
-# -- HUD -----------------------------------------------------------------------
-# ==============================================================================
-
-class HUD(object):
-    def __init__(self, width, height):
-        self.dim = (width, height)
-        self.server_fps = 0
-        self.frame = 0
-        self.simulation_time = 0
-        self._server_clock = pygame.time.Clock()
-
-    def on_world_tick(self, timestamp):
-        self._server_clock.tick()
-        self.server_fps = self._server_clock.get_fps()
-        self.frame = timestamp.frame
-        self.simulation_time = timestamp.elapsed_seconds
-
-    def tick(self, world):
-        pass
-
-# ==============================================================================
 # -- CameraManager -------------------------------------------------------------
 # ==============================================================================
 
 
 class CameraManager(object):
-    def __init__(self, carla, client, world, recorder, hud, gamma_correction, args):
+    def __init__(self, carla, client, world, recorder, gamma_correction, args):
         self.carla = carla
         self.sensor = None
-        self.hud = hud
         self.bboxes = []
         self.image = []
         self.recorder = recorder
@@ -354,16 +387,16 @@ class CameraManager(object):
         self._camera_transforms = self.carla.Transform(self.carla.Location(x=-2.0, y=+0.0, z=20.0), self.carla.Rotation(pitch=8.0))
 
         self.sensors = [
-            ['sensor.camera.rgb', cc.Raw, 'Camera RGB', {}, None],
-            ['sensor.camera.instance_segmentation', cc.Raw, 'Camera Instance Segmentation (Raw)', {}, None],
+            ['sensor.camera.rgb', self.carla.ColorConverter.Raw, 'Camera RGB', {}, None],
+            ['sensor.camera.instance_segmentation', self.carla.ColorConverter.Raw, 'Camera Instance Segmentation (Raw)', {}, None],
         ]
         
         bp_library = world.get_blueprint_library()
         for item in self.sensors:
             bp = bp_library.find(item[0])
             if item[0].startswith('sensor.camera'):
-                bp.set_attribute('image_size_x', str(hud.dim[0]))
-                bp.set_attribute('image_size_y', str(hud.dim[1]))
+                bp.set_attribute('image_size_x', str(self.args.width))
+                bp.set_attribute('image_size_y', str(self.args.height))
                 bp.set_attribute('sensor_tick', str("0.05"))
                 if bp.has_attribute('gamma'):
                     bp.set_attribute('gamma', str(gamma_correction))
@@ -797,14 +830,12 @@ class Recorder(object):
 
 
 def game_loop(args):
-    pygame.init()
     world = None
     original_settings = None
     random.seed(1007)
 
     try:
-        hud = HUD(args.width, args.height)
-        world = World(hud, args)
+        world = World(args)
         while True:
             world.tick()
 
@@ -813,8 +844,6 @@ def game_loop(args):
     finally:
         if world is not None:
             world.destroy()
-
-        pygame.quit()
 
 
 # ==============================================================================
