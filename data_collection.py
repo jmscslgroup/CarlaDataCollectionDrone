@@ -196,7 +196,7 @@ class Manager(object):
 # ==============================================================================
 
 class World(object):
-    def __init__(self, args):
+    def __init__(self, args, weather, carla_map, input_queue, output_queue):
         self.carla = None
         self.load_carla()
         self.server_process = None
@@ -208,17 +208,14 @@ class World(object):
         self.actor_role_name = args.rolename
         self.total_ticks = 0
         self.switch_frequency = args.switch * args.fps
-        self.tick_limit = args.total * args.fps
         self.traffic = None
         self.camera_manager = None
-        self.recorder = None
-        self._weather_presets = find_weather_presets(self.carla)
-        print("Weather presets: ", self._weather_presets)
-        #self._maps = [map for map in self.client.get_available_maps() if "Town" in map]
-        self._maps = ["Town01", "Town02", "Town03", "Town04"]#, "Town06", "Town07"]
-        self._map_index = 0
         self._gamma = args.gamma
-        self.restart()
+        self.weather = weather
+        self.carla_map = carla_map
+        self.input_queue = input_queue
+        self.output_queue = output_queue
+        self.start()
 
     def load_carla(self):
         if self.carla is not None:
@@ -230,13 +227,13 @@ class World(object):
         if self.server_process is None:
             return
         os.killpg(os.getpgid(self.server_process.pid), signal.SIGKILL)
-        wait_for_port_down("localhost", 2000)
+        wait_for_port_down("localhost", self.args.port)
         print("Server killed!")
         self.server_process = None
 
     def spawn_server(self):
         self.server_process = subprocess.Popen("DISPLAY=:1 /home/richarwa/Carla-UE4-Dev-Linux-Shipping/CarlaUE4.sh -fps 20", stdout=subprocess.PIPE, shell=True, preexec_fn=os.setsid)
-        if wait_for_port("localhost", 2000):
+        if wait_for_port("localhost", self.args.port):
             print("Server available!")
         else:
             print("Server not available!")
@@ -271,30 +268,18 @@ class World(object):
             self.spawn_client()
         print("Client setup!")
         
-
-    def respawn_server_and_client(self):
+    def spawn_server_and_client(self):
         if self.server_process is not None:
             self.kill_server()
         self.load_carla()
         self.spawn_server()
         self.spawn_client()
 
-    def restart(self):
-        print("Beginning restart!")
-        if self.traffic is not None:
-            print("Destroying traffic!")
-            self.traffic.destroy()
-            self.traffic_manager = None
-            self.traffic = None
-            print("Traffic destroyed!")
-        if self.camera_manager is not None:
-            print("Destroying sensors!")
-            self.destroy_sensors()
-            print("Sensors destroyed!")
-
+    def start(self):
+        print("Beginning start!")
         print("Creating new world!")
         print("Map ", self._maps[self._map_index])
-        self.respawn_server_and_client()
+        self.spawn_server_and_client()
         self.world = self.client.load_world(self._maps[self._map_index], reset_settings=False)
         print("World created!")
         if self.args.sync:
@@ -304,10 +289,8 @@ class World(object):
             print("Doing async tick!")
             self.world.wait_for_tick()
         print("Tick done!")
-        print("Map ", self._maps[self._map_index])
-        self._map_index += 1
-        self._map_index %= len(self._maps)
-        self.next_weather()
+        print("Map ", self.carla_map)
+        self.world.set_weather(self.weather)
         print("Starting traffic!")
         self.traffic_manager = self.client.get_trafficmanager()
         self.traffic_manager.set_synchronous_mode(self.args.sync)
@@ -316,13 +299,9 @@ class World(object):
         self.traffic.instantiate_traffic()
         print("Traffic spawned!")
         # Set up the sensors.
-        if self.recorder is None:
-            self.recorder = Recorder()
-        else:
-            self.recorder.new_video()
         print("Recorder on new video!")
         print("Starting camera manager!")
-        self.camera_manager = CameraManager(self.carla, self.client, self.world, self.recorder, self._gamma, self.args)
+        self.camera_manager = CameraManager(self.carla, self.client, self.world, self.output_queue, self._gamma, self.args)
         self.camera_manager.create_sensors()
         print("Camera Manager finished!")
  
@@ -331,11 +310,6 @@ class World(object):
         else:
             self.world.wait_for_tick()
         print("New weather: ", self.world.get_weather())
-
-    def next_weather(self, reverse=False):
-        preset = random.choice(self._weather_presets)
-        self.world.set_weather(preset[0])
-        print("New weather preset: ", preset, preset[0])
 
     def tick(self):
         if self.sync:
@@ -346,11 +320,6 @@ class World(object):
         self.total_ticks += 1
         if (self.total_ticks % int(self.args.fps) == 0):
             print(self.total_ticks)
-        if ((self.total_ticks % self.switch_frequency) == 0):
-            print("Restarting at ", self.total_ticks, " with frequnecy of ", self.switch_frequency)
-            self.restart()
-        if (self.total_ticks >= self.tick_limit):
-            self.destroy()
         
     def destroy_sensors(self):
         self.camera_manager.destroy()
@@ -362,7 +331,7 @@ class World(object):
         self.traffic.destroy()
         self.traffic_manager.shut_down()
         self.kill_server()
-        raise Exception("World has been destroyed!")
+        print("World has been destroyed!")
 
 # ==============================================================================
 # -- CameraManager -------------------------------------------------------------
@@ -370,12 +339,12 @@ class World(object):
 
 
 class CameraManager(object):
-    def __init__(self, carla, client, world, recorder, gamma_correction, args):
+    def __init__(self, carla, client, world, output_queue, gamma_correction, args):
         self.carla = carla
         self.sensor = None
         self.bboxes = []
         self.image = []
-        self.recorder = recorder
+        self.output_queue = output_queue
         self.args = args
  
         self.client = client
@@ -488,7 +457,7 @@ class CameraManager(object):
         objs = self.bboxes.pop(0)[0]
         array = self.image.pop(0)[0]
 
-        self.recorder.record_entry(array, objs)
+        self.output_queue.put((array, objs))
 
     def switch_waypoints(self):
         selected_waypoint = random.choice(self.waypoints)
