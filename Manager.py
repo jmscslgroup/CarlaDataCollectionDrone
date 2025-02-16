@@ -1,8 +1,9 @@
 import importlib
 from multiprocessing import Queue, Process
 import re
-from .World import World
-from .Recorder import Recorder
+import random
+from World import World
+from Recorder import Recorder
 
 def find_weather_presets(carla):
     rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')

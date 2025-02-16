@@ -4,7 +4,7 @@ import argparse
 import logging
 import random
 from multiprocessing import Queue, Process, Value, Lock
-from .Manager import Manager
+from Manager import Manager
 # ==============================================================================
 # -- game_loop() ---------------------------------------------------------------
 # ==============================================================================

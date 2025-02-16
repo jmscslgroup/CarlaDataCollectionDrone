@@ -4,8 +4,8 @@ import time
 import socket
 import subprocess
 import signal
-from .Traffic import Traffic
-from .CameraManager import CameraManager
+from Traffic import Traffic
+from CameraManager import CameraManager
 
 def wait_for_port(host, port, timeout=60, check_interval=1):
     start_time = time.time()
