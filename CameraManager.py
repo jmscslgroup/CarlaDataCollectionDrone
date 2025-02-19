@@ -9,8 +9,10 @@ import logging
 
 
 class CameraManager(object):
-    def __init__(self, carla, client, world, output_queue, gamma_correction, args):
+    def __init__(self, carla, client, episode_index, world, output_queue, gamma_correction, args):
         self.carla = carla
+        self.episode_index = episode_index
+        self.image_index = 0
         self.sensor = None
         self.bboxes = []
         self.image = []
@@ -116,18 +118,19 @@ class CameraManager(object):
         bboxes_indices = [self.bboxes[i][1:] for i in range(len(self.bboxes))]
         image_indices = [self.image[i][1:] for i in range(len(self.image))]
         print(bboxes_indices, image_indices)
-        while (self.bboxes[0][1] < self.image[0][1]):
+        while (len(self.bboxes) > 0) and (len(self.image) > 0) and (self.bboxes[0][1] < self.image[0][1]):
             self.bboxes.pop(0)
         if (len(self.bboxes) == 0):
             return
-        while (self.image[0][1] < self.bboxes[0][1]):
+        while (len(self.bboxes) > 0) and (len(self.image) > 0) and (self.image[0][1] < self.bboxes[0][1]):
             self.image.pop(0)
         if (len(self.image) == 0):
             return
         objs = self.bboxes.pop(0)[0]
         array = self.image.pop(0)[0]
 
-        self.output_queue.put((array, objs))
+        self.output_queue.put((array, objs, self.episode_index, self.image_index))
+        self.image_index += 1
 
     def switch_waypoints(self):
         selected_waypoint = random.choice(self.waypoints)

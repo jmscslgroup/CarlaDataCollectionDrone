@@ -34,8 +34,9 @@ def wait_for_port_down(host, port, timeout=60, check_interval=1):
 # ==============================================================================
 
 class World(object):
-    def __init__(self, args, weather, carla_map, input_queue, output_queue):
+    def __init__(self, args, episode_index, weather, carla_map, carla_port, traffic_port, selected_gpu, input_queue, output_queue):
         self.carla = None
+        self.episode_index = episode_index
         self.load_carla()
         self.server_process = None
         self.client = None
@@ -51,8 +52,12 @@ class World(object):
         self._gamma = args.gamma
         self.weather = weather
         self.carla_map = carla_map
+        self.carla_host = "localhost"
+        self.carla_port = carla_port
+        self.traffic_port = traffic_port
         self.input_queue = input_queue
         self.output_queue = output_queue
+        self.carla_command = "DISPLAY=:1 /home/richarwa/Carla-UE4-Dev-Linux-Shipping/CarlaUE4.sh"
         self.start()
 
     def load_carla(self):
@@ -65,13 +70,13 @@ class World(object):
         if self.server_process is None:
             return
         os.killpg(os.getpgid(self.server_process.pid), signal.SIGKILL)
-        wait_for_port_down("localhost", self.args.port)
+        wait_for_port_down(self.carla_host, self.carla_port)
         print("Server killed!")
         self.server_process = None
 
     def spawn_server(self):
-        self.server_process = subprocess.Popen("DISPLAY=:1 /home/richarwa/Carla-UE4-Dev-Linux-Shipping/CarlaUE4.sh -fps 20", stdout=subprocess.PIPE, shell=True, preexec_fn=os.setsid)
-        if wait_for_port("localhost", self.args.port):
+        self.server_process = subprocess.Popen("{} -fps {} -carla-port={}".format(self.carla_command, self.args.fps, int(self.carla_port)), stdout=subprocess.PIPE, shell=True, preexec_fn=os.setsid)
+        if wait_for_port(self.carla_host, self.carla_port):
             print("Server available!")
         else:
             print("Server not available!")
@@ -81,9 +86,9 @@ class World(object):
         if self.client is not None:
             del self.client
             self.client = None
-        self.client = self.carla.Client(self.args.host, self.args.port)
+        self.client = self.carla.Client(self.carla_host, self.carla_port)
         print("Client connected")
-        self.client.set_timeout(5.0)
+        self.client.set_timeout(30.0)
         print("Timeout set!")
 
         try:
@@ -114,32 +119,25 @@ class World(object):
         self.spawn_client()
 
     def start(self):
-        print("Beginning start!")
         print("Creating new world!")
         print("Map ", self.carla_map)
         self.spawn_server_and_client()
         self.world = self.client.load_world(self.carla_map, reset_settings=False)
-        print("World created!")
         if self.args.sync:
-            print("Doing synchronous tick!")
             self.world.tick()
         else:
-            print("Doing async tick!")
             self.world.wait_for_tick()
-        print("Tick done!")
-        print("Map ", self.carla_map)
         self.world.set_weather(self.weather[0])
         print("Starting traffic!")
-        self.traffic_manager = self.client.get_trafficmanager()
+        self.traffic_manager = self.client.get_trafficmanager(self.traffic_port)
         self.traffic_manager.set_synchronous_mode(self.args.sync)
-        print("Spawning traffic!")
         self.traffic = Traffic(self.carla, self.client, self.traffic_manager, self.args)
         self.traffic.instantiate_traffic()
         print("Traffic spawned!")
         # Set up the sensors.
         print("Recorder on new video!")
         print("Starting camera manager!")
-        self.camera_manager = CameraManager(self.carla, self.client, self.world, self.output_queue, self._gamma, self.args)
+        self.camera_manager = CameraManager(self.carla, self.client, self.episode_index, self.world, self.output_queue, self._gamma, self.args)
         self.camera_manager.create_sensors()
         print("Camera Manager finished!")
  

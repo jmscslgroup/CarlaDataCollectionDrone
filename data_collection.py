@@ -17,7 +17,7 @@ def game_loop(args):
 
     try:
         manager = Manager(args)
-        manager.loop()
+        manager.run_episodes()
     except Exception as e:
         print("EXCEPTION: ", e.message)
     finally:
@@ -68,6 +68,9 @@ def main():
     argparser.add_argument(
         '-w', '--number-of-walkers', metavar='W', default=20, type=int,
         help='Number of walkers (default: 20)')
+    argparser.add_argument(
+        '--number-of-simulators', metavar='SIMS', default=2, type=int,
+        help='Number of Simulators (default: 2)')
     argparser.add_argument(
         '-t', '--total', metavar='T', default=86400, type=int,
         help='Total time elapsed')
