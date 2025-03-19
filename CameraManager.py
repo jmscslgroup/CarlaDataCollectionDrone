@@ -93,7 +93,7 @@ class CameraManager(object):
             array = np.reshape(array, (image.height, image.width, 4)).copy()
             id_array = array.astype("uint16")
             semantic_array = id_array[:, :, 2]
-            id_array = (array[:, :, 0] << 8) + array[:, :, 1]
+            id_array = ((array[:, :, 0] << 8) + array[:, :, 1]) + (int(self.episode_index) << 32)
 
             objs = {}
             objs["base_image"] = np.reshape(array, (image.height, image.width, 4)).copy()

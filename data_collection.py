@@ -13,7 +13,8 @@ from Manager import Manager
 def game_loop(args):
     world = None
     original_settings = None
-    random.seed(1007)
+    random.seed(1007) # Training dataset
+    #random.seed(5739) # Eval dataset
 
     try:
         manager = Manager(args)
@@ -69,8 +70,8 @@ def main():
         '-w', '--number-of-walkers', metavar='W', default=20, type=int,
         help='Number of walkers (default: 20)')
     argparser.add_argument(
-        '--number-of-simulators', metavar='SIMS', default=2, type=int,
-        help='Number of Simulators (default: 2)')
+        '--number-of-simulators', metavar='SIMS', default=3, type=int,
+        help='Number of Simulators (default: 3)')
     argparser.add_argument(
         '-t', '--total', metavar='T', default=86400, type=int,
         help='Total time elapsed')

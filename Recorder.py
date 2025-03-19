@@ -68,6 +68,7 @@ class Recorder(object):
             coco_image_index = self.coco_data["video_to_image"][video_index][image_index]
         else:
             coco_image_index = self.add_coco_image_slot()
+            self.coco_data["video_to_image"][video_index].append(coco_image_index)
         image_entry = {"video": int(video_index), "id": int(coco_image_index), "sequence_id": int(image_index), "width": float(width), "height": float(height), "file_name": "%08d/%08d.png" % (video_index, image_index)}
         self.coco_data["images"][coco_image_index] = image_entry
         for track_id in objs:

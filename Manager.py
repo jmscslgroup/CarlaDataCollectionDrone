@@ -9,7 +9,8 @@ from Episode import Episode
 def find_weather_presets(carla):
     rgx = re.compile('.+?(?:(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])|$)')
     name = lambda x: ' '.join(m.group(0) for m in rgx.finditer(x))
-    presets = [x for x in dir(carla.WeatherParameters) if re.match('[A-Z].+', x)]
+    #presets = [x for x in dir(carla.WeatherParameters) if re.match('[A-Z].+', x)]
+    presets = ["ClearNoon", "ClearSunset", "CloudyNoon", "CloudySunset", "HardRainNoon", "HardRainSunset", "MidRainSunset", "MidRainyNoon", "WetNoon", "WetSunset"]
     return [(getattr(carla.WeatherParameters, x), name(x)) for x in presets]
 
 class Manager(object):
@@ -49,6 +50,7 @@ class Manager(object):
             array, objs, video_index, image_or_pool_index = self.recorder_queue.get(timeout=60)
             if array is None:
                 self.episode_process_pool[image_or_pool_index][1] = False
+                self.recorder.save_coco()
                 return
             if self.episode_previous_image_index[video_index] > image_or_pool_index:
                 self.recorder.reset_video(video_index)
